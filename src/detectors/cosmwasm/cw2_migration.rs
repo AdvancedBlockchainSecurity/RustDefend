@@ -1,5 +1,6 @@
+use quote::ToTokens;
 use syn::visit::Visit;
-use syn::ItemFn;
+use syn::{ItemFn, ItemMod};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -49,12 +50,58 @@ const DEPRECATED_PATTERNS: &[(&str, &str)] = &[
     ("to_binary", "to_json_binary"),
 ];
 
+/// Returns true if this function is the CosmWasm migrate *entry point*
+/// (named exactly `migrate`, or carrying an `entry_point` attribute — either
+/// `#[entry_point]` or `#[cfg_attr(..., entry_point)]`). Per-version helper
+/// functions named `migrate_*` are NOT entry points: they are state-transform
+/// steps in the standard per-version-helper idiom, and the contract version is
+/// stamped once by the entry point, so requiring each helper to re-stamp it
+/// would be redundant and produce false positives.
+fn fn_is_migrate_entry_point(func: &ItemFn) -> bool {
+    if func.sig.ident == "migrate" {
+        return true;
+    }
+    func.attrs
+        .iter()
+        .any(|attr| attr.to_token_stream().to_string().contains("entry_point"))
+}
+
+/// Returns true if the migrate body actually performs a migration: it mutates
+/// storage (`.save`/`.update`/`.remove`) or has a success path (`Ok`).
+///
+/// A migrate entry point that performs no state mutation and cannot succeed —
+/// e.g. an intentionally non-migratable stub that unconditionally returns
+/// `Err(...)` — has no successful migration whose contract version could go
+/// unrecorded, so it must not be flagged for a missing set_contract_version.
+///
+/// Note: `fn_body_source` returns a token-stream rendering (punctuation is
+/// spaced out, but identifiers stay intact), so we match on the bare method /
+/// variant idents. This intentionally errs toward returning `true`
+/// (still-flag) so that no real missing-version bug is silently suppressed.
+fn body_performs_migration(body_src: &str) -> bool {
+    body_src.contains("save")
+        || body_src.contains("update")
+        || body_src.contains("remove")
+        || body_src.contains("Ok")
+}
+
 struct MigrationVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     ctx: &'a ScanContext,
 }
 
 impl<'ast, 'a> Visit<'ast> for MigrationVisitor<'a> {
+    fn visit_item_mod(&mut self, module: &'ast ItemMod) {
+        // Do not descend into #[cfg(test)] modules: their contents are never
+        // compiled into the contract wasm, so test scaffolding (e.g. a
+        // `migrate_*` setup helper) must not be flagged as production
+        // migration code.
+        if has_attribute_with_value(&module.attrs, "cfg", "test") {
+            return;
+        }
+        syn::visit::visit_item_mod(self, module);
+    }
+
     fn visit_item_fn(&mut self, func: &'ast ItemFn) {
         let fn_name = func.sig.ident.to_string();
 
@@ -104,11 +151,26 @@ impl<'ast, 'a> Visit<'ast> for MigrationVisitor<'a> {
             || self.ctx.source.contains("get_contract_version")
             || self.ctx.source.contains("CONTRACT_VERSION");
 
-        if file_uses_cw2 {
+        // The version stamp only needs to happen once, in the migrate entry
+        // point. Per-version helper functions (`migrate_*`) delegate the stamp
+        // to their caller, so we only run the missing-version check against the
+        // actual entry point. A vulnerable entry point that never records the
+        // version is still caught.
+        if file_uses_cw2 && fn_is_migrate_entry_point(func) {
             let has_set_version = body_src.contains("set_contract_version")
-                || body_src.contains("set _ contract _ version");
+                || body_src.contains("set _ contract _ version")
+                // cw2::ensure_from_older_version validates the stored contract
+                // name, rejects downgrades, and writes the new version itself
+                // (it calls set_contract_version internally) — strictly stronger
+                // than a bare set_contract_version call.
+                || body_src.contains("ensure_from_older_version");
 
-            if !has_set_version {
+            // A migrate that performs no state mutation and cannot succeed
+            // (an intentionally non-migratable Err stub) has no version to
+            // record, so it is not a missing-version bug.
+            let performs_migration = body_performs_migration(&body_src);
+
+            if !has_set_version && performs_migration {
                 let line = span_to_line(&func.sig.ident.span());
                 self.findings.push(Finding {
                     detector_id: "CW-013".to_string(),
@@ -185,6 +247,121 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag modern cosmwasm-std 2.x API usage"
+        );
+    }
+
+    // FP idx 0: per-version migrate_* helper flagged for a version already set
+    // by the entry point.
+    #[test]
+    fn test_no_finding_migrate_helper_version_set_in_entry_point() {
+        let source = r#"
+            use cw2::set_contract_version;
+            #[entry_point]
+            pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+                cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+                migrate_v1_to_v2(deps)?;
+                Ok(Response::new())
+            }
+
+            fn migrate_v1_to_v2(deps: DepsMut) -> Result<(), ContractError> {
+                let old = OLD_CONFIG.load(deps.storage)?;
+                CONFIG.save(deps.storage, &old.into())?;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "migrate_* helper must not be flagged when the entry point sets the version"
+        );
+    }
+
+    // FP idx 2: cw2::ensure_from_older_version writes the version internally.
+    #[test]
+    fn test_no_finding_ensure_from_older_version() {
+        let source = r#"
+            use cw2::ensure_from_older_version;
+            #[entry_point]
+            pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+                ensure_from_older_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+                Ok(Response::new())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "ensure_from_older_version records the version; should not be flagged"
+        );
+    }
+
+    // FP idx 3: intentionally non-migratable stub that always returns Err.
+    #[test]
+    fn test_no_finding_non_migratable_err_stub() {
+        let source = r#"
+            use cw2::set_contract_version;
+            #[entry_point]
+            pub fn instantiate(deps: DepsMut, _env: Env, _info: MessageInfo, _msg: InstantiateMsg) -> Result<Response, ContractError> {
+                cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+                Ok(Response::new())
+            }
+            #[entry_point]
+            pub fn migrate(_deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+                Err(ContractError::MigrationNotSupported {})
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "A migrate stub that unconditionally returns Err must not be flagged for missing set_contract_version"
+        );
+    }
+
+    // FP idx 4: migrate_* helper inside a #[cfg(test)] module is test
+    // scaffolding, never compiled into the wasm.
+    #[test]
+    fn test_no_finding_migrate_helper_in_cfg_test_module() {
+        let source = r#"
+            use cw2::set_contract_version;
+            #[entry_point]
+            pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+                cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+                Ok(Response::new())
+            }
+
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+
+                fn migrate_with(deps: DepsMut, raw: &Binary) -> StdResult<Response> {
+                    let msg: MigrateMsg = from_binary(raw)?;
+                    migrate(deps, mock_env(), msg)
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "migrate_* helper inside a #[cfg(test)] module must not be flagged"
+        );
+    }
+
+    // Must-still-fire: an entry-point migrate that mutates state and returns Ok
+    // but never records the contract version is a real bug.
+    #[test]
+    fn test_still_flags_entry_point_missing_version() {
+        let source = r#"
+            use cw2::set_contract_version;
+            #[entry_point]
+            pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+                let old = OLD_CONFIG.load(deps.storage)?;
+                CONFIG.save(deps.storage, &old.into())?;
+                Ok(Response::new())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.message.contains("set_contract_version")),
+            "Entry-point migrate that mutates state without recording the version must still be flagged"
         );
     }
 }

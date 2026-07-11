@@ -34,6 +34,26 @@ impl Detector for ProcMacroRiskDetector {
 }
 
 fn is_proc_macro_name(name: &str) -> bool {
+    // Well-known helper/support libraries whose names merely *mention* "proc-macro"
+    // but which are ordinary rlib crates, NOT `proc-macro = true` compiler plugins.
+    // They do not execute at compile time, so the finding message ("proc macros
+    // execute at compile time") is factually wrong for them and their risk profile
+    // is identical to any ordinary library dependency (e.g. serde), which the
+    // detector deliberately does not flag. See DEP-004 FP idx 1.
+    const SUPPORT_LIBS: &[&str] = &[
+        "proc-macro2",
+        "proc_macro2",
+        "proc-macro-error",
+        "proc_macro_error",
+        "proc-macro-error-attr",
+        "proc_macro_error_attr",
+        "proc-macro-crate",
+        "proc_macro_crate",
+    ];
+    if SUPPORT_LIBS.contains(&name) {
+        return false;
+    }
+
     name.ends_with("_derive")
         || name.ends_with("_macro")
         || name.ends_with("-derive")
@@ -43,20 +63,17 @@ fn is_proc_macro_name(name: &str) -> bool {
 }
 
 fn is_unpinned_version(version: &str) -> bool {
-    // Wildcard
-    if version == "*" {
-        return true;
-    }
-
-    // Unpinned major-only version (e.g., "1" or "2" without minor version)
-    let trimmed = version.trim_start_matches('^').trim_start_matches('~');
-    if !trimmed.contains('.') {
-        if let Ok(_) = trimmed.parse::<u32>() {
-            return true;
-        }
-    }
-
-    false
+    // A wildcard spec is genuinely unpinned: fully "*" or a partial wildcard such
+    // as "1.*" / "1.2.*" resolves to an unbounded latest release at build time.
+    //
+    // NOTE: A bare major-only spec such as "1" is NOT treated as unpinned. In Cargo
+    // semver "1" is exactly "^1" — the same floating caret range class as "1.0" or
+    // "1.0.193", which the detector deliberately accepts (see
+    // test_no_finding_for_semver_range). Both float and both are pinned in practice
+    // by the committed Cargo.lock that contracts ship with, so flagging one caret
+    // spec but not the other is an inconsistency, not a supply-chain signal.
+    // See DEP-004 FP idx 0.
+    version.contains('*')
 }
 
 impl ProcMacroRiskDetector {
@@ -89,7 +106,20 @@ impl ProcMacroRiskDetector {
         findings: &mut Vec<Finding>,
     ) {
         for (name, value) in deps {
-            if !is_proc_macro_name(name) {
+            // Classify by the crate that is actually compiled, not the dependency
+            // key. With `package = "..."` the key is an arbitrary local alias, so
+            // classifying on the key both produces false positives (macro-like
+            // alias over a plain library) and false negatives (real proc macro
+            // renamed to a neutral key). Consult the `package` field when present.
+            // See DEP-004 FP idx 2.
+            let classify_name: &str = match value {
+                toml::Value::Table(t) => {
+                    t.get("package").and_then(|v| v.as_str()).unwrap_or(name)
+                }
+                _ => name,
+            };
+
+            if !is_proc_macro_name(classify_name) {
                 continue;
             }
 
@@ -243,20 +273,44 @@ my_derive = "=1.2.3"
         assert!(findings.is_empty(), "Should not flag pinned proc-macro dep");
     }
 
+    // DEP-004 FP idx 0: a bare major-only spec ("1") is caret-equivalent to
+    // "1.0" / "1.0.193" (which test_no_finding_for_semver_range accepts) and is
+    // pinned in practice by the committed Cargo.lock. It must NOT be flagged.
+    // (Replaces the former test_detects_unpinned_major_only, which encoded this
+    // very false positive as a true positive.)
     #[test]
-    fn test_detects_unpinned_major_only() {
+    fn test_no_finding_for_major_only_caret() {
         let cargo_toml = r#"
 [package]
 name = "my-contract"
 version = "0.1.0"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_derive = "1"
 "#;
         let findings = run_detector(cargo_toml);
         assert!(
+            findings.is_empty(),
+            "Should not flag caret-equivalent major-only version for proc-macro"
+        );
+    }
+
+    // A partial wildcard ("1.*") is genuinely unpinned and must still fire.
+    #[test]
+    fn test_detects_partial_wildcard() {
+        let cargo_toml = r#"
+[package]
+name = "my-contract"
+version = "0.1.0"
+
+[dependencies]
+serde_derive = "1.*"
+"#;
+        let findings = run_detector(cargo_toml);
+        assert!(
             !findings.is_empty(),
-            "Should detect major-only version for proc-macro"
+            "Should detect partial wildcard version for proc-macro"
         );
     }
 
@@ -362,5 +416,66 @@ my-proc-macro-lib = "*"
 "#;
         let findings = run_detector(cargo_toml);
         assert!(!findings.is_empty(), "Should detect proc-macro in name");
+    }
+
+    // DEP-004 FP idx 1: proc-macro2 / proc-macro-error / proc-macro-crate are
+    // ordinary rlib support libraries, not `proc-macro = true` crates. They must
+    // not be flagged even with a floating "1" spec.
+    #[test]
+    fn test_no_finding_for_proc_macro_support_libs() {
+        let cargo_toml = r#"
+[package]
+name = "contract-macros-support"
+version = "0.1.0"
+
+[dependencies]
+proc-macro2 = "1"
+proc-macro-error = "1"
+proc-macro-crate = "*"
+proc-macro-error-attr = "*"
+"#;
+        let findings = run_detector(cargo_toml);
+        assert!(
+            findings.is_empty(),
+            "Should not flag proc-macro support libraries (proc-macro2/error/crate)"
+        );
+    }
+
+    // DEP-004 FP idx 2: a macro-like alias over a plain library via `package`
+    // must be classified by the real (compiled) crate name, not the key.
+    #[test]
+    fn test_no_finding_for_renamed_non_macro_package() {
+        let cargo_toml = r#"
+[package]
+name = "my-contract"
+version = "0.1.0"
+
+[dependencies]
+state_macro = { package = "state-utils", version = "*" }
+"#;
+        let findings = run_detector(cargo_toml);
+        assert!(
+            findings.is_empty(),
+            "Should not flag a macro-like alias whose real package is a plain library"
+        );
+    }
+
+    // Mirror of FP idx 2: a real proc macro renamed to a neutral key must still be
+    // detected (closes the corresponding false negative from the same root cause).
+    #[test]
+    fn test_detects_renamed_real_proc_macro() {
+        let cargo_toml = r#"
+[package]
+name = "my-contract"
+version = "0.1.0"
+
+[dependencies]
+helper = { package = "evil_derive", version = "*" }
+"#;
+        let findings = run_detector(cargo_toml);
+        assert!(
+            !findings.is_empty(),
+            "Should detect a real proc macro renamed to a neutral key"
+        );
     }
 }

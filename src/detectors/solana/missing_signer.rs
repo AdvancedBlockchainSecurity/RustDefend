@@ -146,6 +146,10 @@ impl<'ast, 'a> Visit<'ast> for SignerVisitor<'a> {
         }
 
         let body_src = fn_body_source(func);
+        // Token-stream body with string-literal contents removed, so that words
+        // appearing only inside `msg!("...")` / error strings cannot be mistaken
+        // for real code (guards against FP idx 4).
+        let clean_body = strip_string_literals(&body_src);
 
         // Skip if this uses Anchor's Signer<'info> or Account<'info, T> patterns
         let fn_src = func.to_token_stream().to_string();
@@ -203,20 +207,51 @@ impl<'ast, 'a> Visit<'ast> for SignerVisitor<'a> {
             return;
         }
 
-        // Check if body verifies is_signer
-        let has_signer_check = body_src.contains("is_signer") || body_src.contains("has_signer");
+        // Check if body verifies the signer. Beyond the literal `is_signer`
+        // property, this recognises other equivalent, documented enforcement
+        // idioms so they are not falsely flagged:
+        //   * `signer_key()` — solana_program API that returns Some(&Pubkey)
+        //     iff is_signer is true (FP idx 2).
+        //   * calls to a check helper named like assert_signer / require_signer /
+        //     validate_signer (Metaplex `mpl_utils::assert_signer` etc.). Such a
+        //     helper verifies the signer by construction; `?` aborts before any
+        //     mutation (FP idx 0).
+        //   * calls to a same-file helper whose body the call graph has resolved
+        //     to actually contain an is_signer/has_signer check (FP idx 0, the
+        //     `validate_authority(acct)?` case). This is a *resolved* delegation,
+        //     not a name-based skip.
+        let has_signer_check = body_src.contains("is_signer")
+            || body_src.contains("has_signer")
+            || clean_body.contains("signer_key")
+            || body_calls_signer_assert_helper(&clean_body)
+            || callee_checks_signer(&self.ctx.call_graph, &fn_name);
 
-        // Check if the function does any state mutations
-        // Note: lamports() alone is a read-only getter;
-        // only borrow_mut on lamports is a mutation
-        let has_mutations = body_src.contains("serialize")
-            || body_src.contains("try_borrow_mut")
-            || body_src.contains("borrow_mut")
-            || body_src.contains("invoke");
+        // Check if the function does any state mutations.
+        // Notes:
+        //   * lamports() alone is a read-only getter; only borrow_mut on lamports
+        //     is a mutation.
+        //   * `deserialize` is a read, but naively substring-matches "serialize";
+        //     strip it before testing so pure Borsh reads aren't treated as
+        //     writes (FP idx 1).
+        //   * has_mutations is computed on the string-literal-stripped body so
+        //     that "invoke"/"serialize" inside a log message don't count
+        //     (FP idx 4).
+        let body_no_deser = clean_body.replace("deserialize", " ");
+        let has_mutations = body_no_deser.contains("serialize")
+            || clean_body.contains("try_borrow_mut")
+            || clean_body.contains("borrow_mut")
+            || clean_body.contains("invoke");
 
-        // Check if any caller in the same file already checks signer (call graph analysis)
+        // Check if any caller already checks signer before dispatching to this
+        // function. Free-function callers are covered by the call graph;
+        // impl-method callers (the SPL `impl Processor` dispatcher idiom) are not
+        // tracked by build_call_graph, so resolve them directly here (FP idx 3).
         if !has_signer_check
-            && call_graph::caller_has_check(&self.ctx.call_graph, &fn_name, CheckKind::SignerCheck)
+            && (call_graph::caller_has_check(
+                &self.ctx.call_graph,
+                &fn_name,
+                CheckKind::SignerCheck,
+            ) || impl_method_caller_checks_signer(&self.ctx.ast, &fn_name))
         {
             return;
         }
@@ -251,6 +286,136 @@ impl<'ast, 'a> Visit<'ast> for SignerVisitor<'a> {
             });
         }
         // Don't recurse into nested functions
+    }
+}
+
+/// Remove the contents of double-quoted string literals from a token-stream
+/// string, replacing each literal with a single space. This prevents words that
+/// appear only inside `msg!("...")` or error-message strings from being matched
+/// as if they were real code (mutation keywords, `is_signer`, etc.).
+fn strip_string_literals(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in src.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+                out.push(' ');
+            }
+            // characters inside the string literal are dropped
+        } else if c == '"' {
+            in_str = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Returns true if the (string-literal-stripped) body calls a signer-assertion
+/// helper such as `assert_signer`, `require_signer`, `validate_signer`,
+/// `check_is_signer`, etc. These snake_case helper names verify signer status by
+/// construction (e.g. Metaplex `mpl_utils::assert_signer`, whose body is
+/// `if !info.is_signer { return Err(MissingRequiredSignature) }`), so the `?`
+/// propagation of their result aborts the function before any mutation.
+///
+/// Only snake_case `verb_signer` / `verb_is_signer` identifier forms are matched,
+/// so PascalCase items like an error variant `SignerCheckMissing` do NOT match —
+/// avoiding accidental suppression of a real finding.
+fn body_calls_signer_assert_helper(body: &str) -> bool {
+    const VERBS: [&str; 6] = [
+        "assert", "require", "check", "verify", "validate", "ensure",
+    ];
+    for v in VERBS {
+        if body.contains(&format!("{}_signer", v)) || body.contains(&format!("{}_is_signer", v)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if any function called directly from `fn_name`'s body is a
+/// same-file helper whose body the call graph resolved to contain a signer
+/// check (is_signer / has_signer). This is a *resolved* delegation: it only
+/// suppresses when the callee's body actually performs the check, never based on
+/// name alone.
+fn callee_checks_signer(graph: &call_graph::CallGraph, fn_name: &str) -> bool {
+    if let Some(info) = graph.get(fn_name) {
+        for callee in &info.calls {
+            if let Some(callee_info) = graph.get(callee) {
+                if callee_info.has_signer_check {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolve impl-method callers that build_call_graph does not track. Returns
+/// true if some method in an `impl` block both performs a signer check and calls
+/// `target_fn` — the SPL `impl Processor { fn process(..) { check; dispatch(..) } }`
+/// idiom, semantically identical to the free-function caller-validates pattern
+/// the detector already accepts.
+fn impl_method_caller_checks_signer(ast: &syn::File, target_fn: &str) -> bool {
+    struct Finder<'a> {
+        target_fn: &'a str,
+        found: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for Finder<'a> {
+        fn visit_impl_item_fn(&mut self, m: &'ast syn::ImplItemFn) {
+            if self.found {
+                return;
+            }
+            let body = m.block.to_token_stream().to_string();
+            let clean = strip_string_literals(&body);
+            let has_check = clean.contains("is_signer")
+                || clean.contains("has_signer")
+                || clean.contains("signer_key")
+                || body_calls_signer_assert_helper(&clean);
+            if has_check {
+                let mut collector = CallNameCollector { names: Vec::new() };
+                collector.visit_block(&m.block);
+                if collector.names.iter().any(|n| n == self.target_fn) {
+                    self.found = true;
+                    return;
+                }
+            }
+            syn::visit::visit_impl_item_fn(self, m);
+        }
+    }
+
+    let mut finder = Finder {
+        target_fn,
+        found: false,
+    };
+    finder.visit_file(ast);
+    finder.found
+}
+
+/// Collects the names of functions/methods called within a block.
+struct CallNameCollector {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for CallNameCollector {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(syn::ExprPath { path, .. }) = node.func.as_ref() {
+            if let Some(seg) = path.segments.last() {
+                self.names.push(seg.ident.to_string());
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.names.push(node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
     }
 }
 
@@ -397,6 +562,133 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag validate/verify/check utility functions"
+        );
+    }
+
+    // ---- FP-elimination regression tests ----
+
+    // FP idx 0: signer check delegated to a well-known assertion helper
+    // (`mpl_utils::assert_signer`). The `?` aborts before any lamport mutation.
+    #[test]
+    fn test_no_finding_assert_signer_helper() {
+        let source = r#"
+            pub fn withdraw(authority: &AccountInfo, escrow_wallet: &AccountInfo, amount: u64) -> ProgramResult {
+                assert_signer(authority)?;
+                **escrow_wallet.try_borrow_mut_lamports()? -= amount;
+                **authority.try_borrow_mut_lamports()? += amount;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag when a signer-assertion helper (assert_signer) is called"
+        );
+    }
+
+    // FP idx 0 (resolved-delegation variant): the signer check lives in a
+    // same-file helper whose body the call graph resolves to contain is_signer.
+    #[test]
+    fn test_no_finding_signer_check_delegated_to_local_helper() {
+        let source = r#"
+            pub fn withdraw(authority: &AccountInfo, escrow: &AccountInfo, amount: u64) -> ProgramResult {
+                validate_authority(authority)?;
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                Ok(())
+            }
+
+            fn validate_authority(authority: &AccountInfo) -> ProgramResult {
+                if !authority.is_signer {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag when a resolved local helper performs the is_signer check"
+        );
+    }
+
+    // FP idx 1: read-only getter mis-flagged because contains("serialize")
+    // substring-matches "deserialize".
+    #[test]
+    fn test_no_finding_readonly_deserialize_getter() {
+        let source = r#"
+            pub fn get_balance(owner: &AccountInfo) -> Result<u64, ProgramError> {
+                let state = TokenState::deserialize(&mut &owner.data.borrow()[..])?;
+                Ok(state.balance)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag a pure read that only deserializes account data"
+        );
+    }
+
+    // FP idx 2: signer verified via AccountInfo::signer_key() instead of is_signer.
+    #[test]
+    fn test_no_finding_signer_key_check() {
+        let source = r#"
+            pub fn withdraw(authority: &AccountInfo, escrow: &AccountInfo, amount: u64) -> ProgramResult {
+                let _key = authority
+                    .signer_key()
+                    .ok_or(ProgramError::MissingRequiredSignature)?;
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                **authority.try_borrow_mut_lamports()? += amount;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag when the signer is enforced via signer_key()"
+        );
+    }
+
+    // FP idx 3: caller signer check lives in an `impl Processor` block, which
+    // build_call_graph does not track. The dispatched free fn must not be flagged.
+    #[test]
+    fn test_no_finding_impl_block_caller_checks_signer() {
+        let source = r#"
+            pub struct Processor;
+            impl Processor {
+                pub fn process(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+                    let authority = &accounts[0];
+                    if !authority.is_signer {
+                        return Err(ProgramError::MissingRequiredSignature);
+                    }
+                    withdraw(authority, &accounts[1], amount)
+                }
+            }
+
+            fn withdraw(authority: &AccountInfo, escrow: &AccountInfo, amount: u64) -> ProgramResult {
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag when an impl-block caller checks signer before dispatch"
+        );
+    }
+
+    // FP idx 4: read-only logging function mis-flagged because "invoke"/"serialize"
+    // appear only inside a msg! string literal.
+    #[test]
+    fn test_no_finding_log_only_string_literal_keywords() {
+        let source = r#"
+            pub fn log_status(user: &AccountInfo) {
+                msg!("invoke count for {}: pending serialize", user.key);
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag a log-only fn whose 'invoke'/'serialize' are in a string literal"
         );
     }
 }

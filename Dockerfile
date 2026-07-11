@@ -36,7 +36,7 @@ ENTRYPOINT ["rustdefend"]
 
 LABEL org.opencontainers.image.title="RustDefend" \
       org.opencontainers.image.description="Static security scanner for Rust smart contracts" \
-      org.opencontainers.image.version="0.5.0" \
+      org.opencontainers.image.version="0.5.1" \
       org.opencontainers.image.authors="dehvCurtis" \
       org.opencontainers.image.url="https://github.com/0xStarBridge/RustDefend" \
       org.opencontainers.image.source="https://github.com/0xStarBridge/RustDefend" \

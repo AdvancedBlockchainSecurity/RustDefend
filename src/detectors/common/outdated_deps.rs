@@ -137,106 +137,104 @@ impl OutdatedDepsDetector {
         // Check [dependencies] and [dev-dependencies]
         for section in &["dependencies", "dev-dependencies"] {
             if let Some(deps) = parsed.get(section).and_then(|v| v.as_table()) {
-                for range in VULNERABLE_RANGES {
-                    if let Some(dep) = deps.get(range.crate_name) {
-                        let version = match dep {
-                            toml::Value::String(v) => v.clone(),
-                            toml::Value::Table(t) => {
-                                if t.contains_key("git") || t.contains_key("path") {
-                                    continue; // Can't check git/path deps
-                                }
-                                t.get("version")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string()
-                            }
-                            _ => continue,
-                        };
-
-                        if version.is_empty() || version == "*" {
-                            continue;
-                        }
-
-                        if (range.is_vulnerable)(&version) {
-                            // Find line number
-                            let line = find_dep_line(&content, range.crate_name);
-
-                            findings.push(Finding {
-                                detector_id: "DEP-001".to_string(),
-                                name: "outdated-dependencies".to_string(),
-                                severity: Severity::High,
-                                confidence: Confidence::High,
-                                message: format!(
-                                    "Vulnerable dependency: {} = \"{}\" ({})",
-                                    range.crate_name, version, range.description
-                                ),
-                                file: cargo_toml_path.clone(),
-                                line,
-                                column: 1,
-                                snippet: format!("{} = \"{}\"", range.crate_name, version),
-                                recommendation: format!(
-                                    "Update {} to a patched version. Advisory: {}",
-                                    range.crate_name, range.advisory
-                                ),
-                                chain: range.chain,
-                            });
-                        }
-                    }
-                }
+                check_deps_table(deps, &content, cargo_toml_path, false, &mut findings);
             }
         }
 
         // Also check workspace dependencies
         if let Some(workspace) = parsed.get("workspace") {
             if let Some(deps) = workspace.get("dependencies").and_then(|v| v.as_table()) {
-                for range in VULNERABLE_RANGES {
-                    if let Some(dep) = deps.get(range.crate_name) {
-                        let version = match dep {
-                            toml::Value::String(v) => v.clone(),
-                            toml::Value::Table(t) => {
-                                if t.contains_key("git") || t.contains_key("path") {
-                                    continue;
-                                }
-                                t.get("version")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string()
-                            }
-                            _ => continue,
-                        };
-
-                        if version.is_empty() || version == "*" {
-                            continue;
-                        }
-
-                        if (range.is_vulnerable)(&version) {
-                            let line = find_dep_line(&content, range.crate_name);
-                            findings.push(Finding {
-                                detector_id: "DEP-001".to_string(),
-                                name: "outdated-dependencies".to_string(),
-                                severity: Severity::High,
-                                confidence: Confidence::High,
-                                message: format!(
-                                    "Vulnerable workspace dependency: {} = \"{}\" ({})",
-                                    range.crate_name, version, range.description
-                                ),
-                                file: cargo_toml_path.clone(),
-                                line,
-                                column: 1,
-                                snippet: format!("{} = \"{}\"", range.crate_name, version),
-                                recommendation: format!(
-                                    "Update {} to a patched version. Advisory: {}",
-                                    range.crate_name, range.advisory
-                                ),
-                                chain: range.chain,
-                            });
-                        }
-                    }
-                }
+                check_deps_table(deps, &content, cargo_toml_path, true, &mut findings);
             }
         }
 
         findings
+    }
+}
+
+/// Scan a dependency table, honoring Cargo's `package = "..."` rename so that the
+/// crate identity we test against advisories is the *real* fetched crate, not the
+/// local alias used as the table key.
+///
+/// - `ink = { version = "3.0", package = "inkjet" }` resolves to the unrelated
+///   crate `inkjet`; the ink! framework is not in the graph, so it must NOT flag.
+/// - Symmetrically, `myink = { version = "3.0", package = "ink" }` genuinely pulls
+///   in `ink`, so it MUST still be checked (no false negative from key-only lookup).
+fn check_deps_table(
+    deps: &toml::value::Table,
+    content: &str,
+    cargo_toml_path: &PathBuf,
+    is_workspace: bool,
+    findings: &mut Vec<Finding>,
+) {
+    for (key, dep) in deps {
+        // Resolve the version requirement and the *effective* crate name.
+        let (version, effective_name) = match dep {
+            toml::Value::String(v) => (v.clone(), key.as_str()),
+            toml::Value::Table(t) => {
+                if t.contains_key("git") || t.contains_key("path") {
+                    continue; // Can't check git/path deps
+                }
+                // `package = "X"` renames the crate: the real dependency is X,
+                // and `key` is only the local import alias.
+                let effective = t
+                    .get("package")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or(key.as_str());
+                let version = t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (version, effective)
+            }
+            _ => continue,
+        };
+
+        if version.is_empty() || version == "*" {
+            continue;
+        }
+
+        for range in VULNERABLE_RANGES {
+            if range.crate_name != effective_name {
+                continue;
+            }
+
+            if (range.is_vulnerable)(&version) {
+                // Anchor the reported line on the table key actually written in
+                // the file (which may be a `package` alias).
+                let line = find_dep_line(content, key);
+
+                let message = if is_workspace {
+                    format!(
+                        "Vulnerable workspace dependency: {} = \"{}\" ({})",
+                        range.crate_name, version, range.description
+                    )
+                } else {
+                    format!(
+                        "Vulnerable dependency: {} = \"{}\" ({})",
+                        range.crate_name, version, range.description
+                    )
+                };
+
+                findings.push(Finding {
+                    detector_id: "DEP-001".to_string(),
+                    name: "outdated-dependencies".to_string(),
+                    severity: Severity::High,
+                    confidence: Confidence::High,
+                    message,
+                    file: cargo_toml_path.clone(),
+                    line,
+                    column: 1,
+                    snippet: format!("{} = \"{}\"", range.crate_name, version),
+                    recommendation: format!(
+                        "Update {} to a patched version. Advisory: {}",
+                        range.crate_name, range.advisory
+                    ),
+                    chain: range.chain,
+                });
+            }
+        }
     }
 }
 
@@ -324,5 +322,48 @@ cosmwasm-std = { git = "https://github.com/CosmWasm/cosmwasm", branch = "main" }
 "#;
         let findings = run_detector(cargo_toml);
         assert!(findings.is_empty(), "Should skip git dependencies");
+    }
+
+    // FP idx 3: a dependency renamed via `package = "..."` must be identified by
+    // the real crate it fetches, not the local table-key alias. Here the key is
+    // `ink` but the actual crate is the unrelated `inkjet`, so the "ink! < 4.0.0"
+    // advisory cannot apply and no finding must be produced.
+    #[test]
+    fn test_no_finding_package_rename_to_unrelated_crate() {
+        let cargo_toml = r#"
+[package]
+name = "my-crate"
+version = "0.1.0"
+
+[dependencies]
+ink = { version = "3.0", package = "inkjet" }
+"#;
+        let findings = run_detector(cargo_toml);
+        assert!(
+            findings.is_empty(),
+            "Should not flag `ink` alias that actually resolves to the crate `inkjet`"
+        );
+    }
+
+    // Symmetric true-positive guard for the same fix: a monitored crate pulled in
+    // under a *different* alias via `package = "ink"` genuinely brings the
+    // vulnerable ink! framework into the graph and MUST still be flagged. This
+    // ensures honoring `package` did not introduce a false negative.
+    #[test]
+    fn test_detects_monitored_crate_under_alias() {
+        let cargo_toml = r#"
+[package]
+name = "my-crate"
+version = "0.1.0"
+
+[dependencies]
+my_ink = { version = "3.0", package = "ink" }
+"#;
+        let findings = run_detector(cargo_toml);
+        assert!(
+            !findings.is_empty(),
+            "Should detect vulnerable `ink` even when aliased under another key"
+        );
+        assert_eq!(findings[0].chain, Chain::Ink);
     }
 }
