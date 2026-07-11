@@ -1,6 +1,6 @@
 use quote::ToTokens;
 use syn::visit::Visit;
-use syn::{ExprMethodCall, ItemFn};
+use syn::{ExprMethodCall, ItemFn, ItemMod};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -59,8 +59,46 @@ struct OverflowVisitor<'a> {
     in_function: bool,
 }
 
+/// Returns true if the attributes mark this item as test-only code, i.e.
+/// `#[cfg(test)]`, `#[test]`, or a framework test attribute
+/// (`#[tokio::test]`, `#[ink::test]`, `#[near_sdk::test]`, ...). Such code is
+/// excluded from the release WASM build and never executes on-chain, so
+/// intentional overflow edge-case exercises there are not deployable
+/// vulnerabilities.
+fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    // #[cfg(test)] on a module or fn.
+    if has_nested_attribute(attrs, "cfg", "test") {
+        return true;
+    }
+    attrs.iter().any(|attr| {
+        // Match the last path segment so that plain `#[test]` as well as
+        // `#[tokio::test]`, `#[ink::test]`, `#[near_sdk::test]`, etc. are all
+        // treated as test attributes.
+        attr.path()
+            .segments
+            .last()
+            .map(|seg| seg.ident == "test")
+            .unwrap_or(false)
+    })
+}
+
 impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
+    fn visit_item_mod(&mut self, module: &'ast ItemMod) {
+        // Do not descend into test-only modules (`#[cfg(test)] mod tests`).
+        // Their arithmetic is compiled out of the deployed contract and often
+        // intentionally exercises overflow edge cases.
+        if is_test_only(&module.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, module);
+    }
+
     fn visit_item_fn(&mut self, func: &'ast ItemFn) {
+        // Skip test functions (`#[test]`, `#[tokio::test]`, `#[ink::test]`,
+        // `#[cfg(test)] fn ...`) even if they are not inside a test module.
+        if is_test_only(&func.attrs) {
+            return;
+        }
         self.in_function = true;
         syn::visit::visit_item_fn(self, func);
         self.in_function = false;
@@ -152,5 +190,50 @@ mod tests {
         "#;
         let findings = run_detector(source);
         assert!(findings.is_empty(), "Should not flag checked_add");
+    }
+
+    #[test]
+    fn test_no_finding_in_cfg_test_module() {
+        // FP idx 4: wrapping_add inside a #[cfg(test)] module is test-only
+        // code (compiled out of the deployed WASM) that intentionally
+        // exercises the overflow edge case. It must not be flagged.
+        let source = r#"
+            use near_sdk::env;
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn balance_wraps_at_u128_max_is_rejected() {
+                    let balance: u128 = u128::MAX;
+                    let wrapped = balance.wrapping_add(1);
+                    assert_eq!(wrapped, 0);
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag wrapping_add inside #[cfg(test)] module"
+        );
+    }
+
+    #[test]
+    fn test_no_finding_in_test_fn() {
+        // A #[test] function not wrapped in a #[cfg(test)] module is still
+        // test-only code and must not be flagged.
+        let source = r#"
+            use near_sdk::env;
+
+            #[test]
+            fn balance_overflow_case() {
+                let balance: u128 = u128::MAX;
+                let _ = balance.wrapping_add(1);
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag wrapping_add inside a #[test] fn"
+        );
     }
 }

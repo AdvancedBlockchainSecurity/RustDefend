@@ -4,6 +4,20 @@ All notable changes to RustDefend will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-07-11
+
+### Fixed
+
+- Reduce false positives across all 61 detectors: 253 empirically-proven FPs eliminated with sound AST-based guards (ADV-206)
+- Recognize validation delegated to a helper by resolving the callee body via the in-file call graph, not name-based skips (ADV-206)
+- Match parsed tokens instead of raw source so patterns in comments and string literals no longer trigger findings (ADV-206)
+- Skip `#[cfg(test)]` modules and test/mock helpers so non-shipped code is not flagged (ADV-206)
+- Recognize const/literal and floating-point arithmetic operands to avoid spurious integer-overflow findings (ADV-206)
+
+### Changed
+
+- Add a should-not-flag regression test for every fixed false positive; suite now 570 tests, 0 failures (ADV-206)
+
 ## [0.5.0] - 2026-02-17
 
 ### Added
