@@ -421,9 +421,6 @@ mod tests {
             }
         "#;
         let findings = run_detector(source);
-        assert!(
-            findings.is_empty(),
-            "#[test] functions must not be flagged"
-        );
+        assert!(findings.is_empty(), "#[test] functions must not be flagged");
     }
 }

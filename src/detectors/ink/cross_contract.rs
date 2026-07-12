@@ -381,10 +381,7 @@ mod tests {
             }
         "#;
         let findings = run_detector(source);
-        assert!(
-            findings.is_empty(),
-            ".is_err() check must not be flagged"
-        );
+        assert!(findings.is_empty(), ".is_err() check must not be flagged");
     }
 
     // FP idx 3: result bound and matched a few lines later (blank line between).

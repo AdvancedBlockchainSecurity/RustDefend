@@ -258,7 +258,9 @@ impl<'ast, 'a> Visit<'ast> for ResponseVisitor<'a> {
             line,
             column: span_to_column(&func.sig.ident.span()),
             snippet: snippet_at_line(&self.ctx.source, line),
-            recommendation: "Validate query responses before using them (check bounds, expected values, etc.)".to_string(),
+            recommendation:
+                "Validate query responses before using them (check bounds, expected values, etc.)"
+                    .to_string(),
             chain: Chain::CosmWasm,
         });
     }

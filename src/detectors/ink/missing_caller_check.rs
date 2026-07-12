@@ -174,9 +174,10 @@ impl<'ast, 'a> Visit<'ast> for CallerVisitor<'a> {
         if !has_caller_check {
             let called = extract_self_method_calls(&body_src);
             let mut visited: Vec<String> = Vec::new();
-            if called.iter().any(|callee| {
-                resolved_call_has_check(self.method_bodies, callee, &mut visited, 0)
-            }) {
+            if called
+                .iter()
+                .any(|callee| resolved_call_has_check(self.method_bodies, callee, &mut visited, 0))
+            {
                 has_caller_check = true;
             }
         }

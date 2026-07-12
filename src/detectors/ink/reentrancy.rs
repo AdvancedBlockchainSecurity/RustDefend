@@ -32,9 +32,7 @@ impl Detector for ReentrancyDetector {
         // argument passed to `set_allow_reentry` so that `set_allow_reentry(false)`
         // chained on the same line as another flag set to `true`
         // (e.g. `set_tail_call(true)`) is not misclassified.
-        let mut visitor = ReentryVisitor {
-            hits: Vec::new(),
-        };
+        let mut visitor = ReentryVisitor { hits: Vec::new() };
         visitor.visit_file(&ctx.ast);
 
         let mut findings = Vec::new();
@@ -87,9 +85,7 @@ fn is_test_item(attrs: &[syn::Attribute]) -> bool {
 /// True if any argument is the boolean literal `true`. `set_allow_reentry`
 /// takes a single bool; a real vulnerability always writes `true` literally,
 /// so a non-literal (variable) argument is intentionally not flagged here.
-fn has_true_literal_arg(
-    args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>,
-) -> bool {
+fn has_true_literal_arg(args: &syn::punctuated::Punctuated<syn::Expr, syn::token::Comma>) -> bool {
     args.iter().any(|arg| {
         matches!(
             arg,

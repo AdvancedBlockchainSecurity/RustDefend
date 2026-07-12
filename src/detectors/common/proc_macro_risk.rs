@@ -113,9 +113,7 @@ impl ProcMacroRiskDetector {
             // renamed to a neutral key). Consult the `package` field when present.
             // See DEP-004 FP idx 2.
             let classify_name: &str = match value {
-                toml::Value::Table(t) => {
-                    t.get("package").and_then(|v| v.as_str()).unwrap_or(name)
-                }
+                toml::Value::Table(t) => t.get("package").and_then(|v| v.as_str()).unwrap_or(name),
                 _ => name,
             };
 

@@ -70,9 +70,7 @@ impl Detector for BuildScriptDetector {
             "Command::new(\"powershell\")",
         ];
 
-        for (idx, (code_line, orig_line)) in
-            stripped.lines().zip(ctx.source.lines()).enumerate()
-        {
+        for (idx, (code_line, orig_line)) in stripped.lines().zip(ctx.source.lines()).enumerate() {
             let line_number = idx + 1;
 
             if ctx.is_suppressed(line_number, "DEP-003") {
@@ -351,8 +349,8 @@ fn out_dir_tainted_idents(stripped: &str) -> HashSet<String> {
                 None => continue,
             };
             let rhs = &after[eq + 1..];
-            let derived = contains_word(rhs, "OUT_DIR")
-                || tainted.iter().any(|ti| contains_word(rhs, ti));
+            let derived =
+                contains_word(rhs, "OUT_DIR") || tainted.iter().any(|ti| contains_word(rhs, ti));
             if derived {
                 tainted.insert(ident);
                 changed = true;
@@ -415,7 +413,15 @@ fn fs_first_arg_base_ident(line: &str, call: &str) -> Option<String> {
 /// compile-only / config / create-archive and is not a shell escape.
 fn shell_arg_c_lines(stripped: &str) -> HashSet<usize> {
     const SHELLS: &[&str] = &[
-        "sh", "bash", "zsh", "dash", "ksh", "fish", "cmd", "powershell", "pwsh",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "cmd",
+        "powershell",
+        "pwsh",
     ];
     let pat = ".arg(\"-c\")";
     let mut result = HashSet::new();

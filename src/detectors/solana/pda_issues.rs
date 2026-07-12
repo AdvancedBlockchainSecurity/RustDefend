@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use syn::visit::Visit;
-use syn::{Block, Expr, ExprCall, ExprMethodCall, Attribute, ItemFn, ItemMod, Member};
+use syn::{Attribute, Block, Expr, ExprCall, ExprMethodCall, ItemFn, ItemMod, Member};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -172,8 +172,7 @@ fn collect_cpa_calls(block: &Block) -> Vec<Expr> {
     impl<'ast> Visit<'ast> for V {
         fn visit_expr_call(&mut self, node: &'ast ExprCall) {
             if let Expr::Path(p) = node.func.as_ref() {
-                if p
-                    .path
+                if p.path
                     .segments
                     .last()
                     .map(|s| s.ident == "create_program_address")

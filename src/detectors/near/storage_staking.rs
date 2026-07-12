@@ -292,10 +292,7 @@ impl<'ast, 'a> Visit<'ast> for StorageVisitor<'a> {
         let is_internal_shaped = fn_name.starts_with("internal_")
             || fn_name.ends_with("_impl")
             || fn_name.ends_with("_unchecked");
-        if is_internal_shaped
-            && has_account_id_param(&func.sig)
-            && self.auth_in_callers(&fn_name)
-        {
+        if is_internal_shaped && has_account_id_param(&func.sig) && self.auth_in_callers(&fn_name) {
             return;
         }
 

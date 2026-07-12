@@ -147,8 +147,7 @@ impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
         // Division is intentionally excluded: unsigned integer division cannot
         // overflow. Its only failure mode is divide-by-zero, which is a
         // different (and out-of-scope) class and panics-reverts safely anyway.
-        let is_arithmetic =
-            matches!(expr.op, BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_));
+        let is_arithmetic = matches!(expr.op, BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_));
 
         if !is_arithmetic {
             syn::visit::visit_expr_binary(self, expr);
@@ -318,9 +317,7 @@ fn is_uint_operand(expr: &syn::Expr, uints: &HashSet<String>) -> bool {
         syn::Expr::Reference(e) => is_uint_operand(&e.expr, uints),
         syn::Expr::Try(e) => is_uint_operand(&e.expr, uints),
         // (a + b) * c — a Uint sub-expression makes the whole thing Uint.
-        syn::Expr::Binary(b) => {
-            is_uint_operand(&b.left, uints) || is_uint_operand(&b.right, uints)
-        }
+        syn::Expr::Binary(b) => is_uint_operand(&b.left, uints) || is_uint_operand(&b.right, uints),
         // amount.multiply_ratio(..) / balance.min(..): receiver type propagates.
         syn::Expr::MethodCall(m) => is_uint_operand(&m.receiver, uints),
         // Uint128::new(..) / Uint128::from(..): inspect only the callee.
@@ -350,7 +347,9 @@ fn is_const_operand(expr: &syn::Expr) -> bool {
                 let s = id.to_string();
                 // A const by convention: all-uppercase (with digits/underscores)
                 // and containing at least one letter.
-                return s.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+                return s
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
                     && s.chars().any(|c| c.is_ascii_uppercase());
             }
             false

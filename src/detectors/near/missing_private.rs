@@ -200,7 +200,9 @@ impl<'ast, 'a> Visit<'ast> for PrivateVisitor<'a> {
             line,
             column: span_to_column(&method.sig.ident.span()),
             snippet: snippet_at_line(&self.ctx.source, line),
-            recommendation: "Add #[private] attribute to ensure only the contract itself can call this callback".to_string(),
+            recommendation:
+                "Add #[private] attribute to ensure only the contract itself can call this callback"
+                    .to_string(),
             chain: Chain::Near,
         });
     }

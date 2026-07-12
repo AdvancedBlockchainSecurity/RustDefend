@@ -125,7 +125,11 @@ impl<'a> StorageVisitor<'a> {
     /// the common refactoring where the guard is factored into an `ensure_capacity()`
     /// style helper called before the push. Only sibling helpers whose bodies we can
     /// actually resolve are consulted (one level deep), so no name-based blanket skip.
-    fn helper_enforces_bound(&self, body_calls: &[syn::ExprMethodCall], siblings: &HashMap<String, String>) -> bool {
+    fn helper_enforces_bound(
+        &self,
+        body_calls: &[syn::ExprMethodCall],
+        siblings: &HashMap<String, String>,
+    ) -> bool {
         for call in body_calls {
             if !expr_base_is_self(call.receiver.as_ref()) {
                 continue;

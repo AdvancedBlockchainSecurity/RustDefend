@@ -122,9 +122,9 @@ fn is_test_fn(func: &ItemFn) -> bool {
 
 /// True if the attribute list contains `#[cfg(test)]` (including `cfg(all(test, ...))`).
 fn module_is_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().is_ident("cfg") && a.meta.to_token_stream().to_string().contains("test")
-    })
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("cfg") && a.meta.to_token_stream().to_string().contains("test"))
 }
 
 /// Core analysis: does this function write/read storage using a key that is

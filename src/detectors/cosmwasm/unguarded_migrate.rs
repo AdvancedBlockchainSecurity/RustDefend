@@ -164,9 +164,9 @@ fn is_test_attr(func: &ItemFn) -> bool {
 
 /// True if any attribute is `#[cfg(test)]` (or another cfg gating on `test`).
 fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().is_ident("cfg") && a.meta.to_token_stream().to_string().contains("test")
-    })
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("cfg") && a.meta.to_token_stream().to_string().contains("test"))
 }
 
 struct MigrateVisitor<'a> {
@@ -458,10 +458,7 @@ mod tests {
             }
         "#;
         let findings = run_detector(source);
-        assert!(
-            findings.is_empty(),
-            "Pure struct converter should not flag"
-        );
+        assert!(findings.is_empty(), "Pure struct converter should not flag");
     }
 
     // FP idx 3: migrate test double inside a #[cfg(test)] module.

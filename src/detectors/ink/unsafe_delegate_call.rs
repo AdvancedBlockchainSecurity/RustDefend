@@ -128,8 +128,9 @@ fn analyze_delegate(block: &Block, body_src: &str) -> (bool, Vec<String>) {
 
     // Text fallback covers `DelegateCall::new(..)` / `Call::DelegateCall`
     // style constructs that are not a `.delegate(..)` method call.
-    let has_delegate =
-        has_method_delegate || body_src.contains("DelegateCall") || body_src.contains("delegate_call");
+    let has_delegate = has_method_delegate
+        || body_src.contains("DelegateCall")
+        || body_src.contains("delegate_call");
 
     (has_delegate, args)
 }

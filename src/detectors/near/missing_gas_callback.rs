@@ -157,8 +157,7 @@ impl<'ast, 'a> Visit<'ast> for GasVisitor<'a> {
         // (e.g. `Promise :: new`, `. function_call (`). Only the spaced variants
         // are matched here; the previously-listed unspaced forms could only ever
         // match inside string literals (e.g. env::log_str("Promise::new ...")).
-        let has_ext_call =
-            body_src.contains("ext_self ::") || body_src.contains("ext_contract ::");
+        let has_ext_call = body_src.contains("ext_self ::") || body_src.contains("ext_contract ::");
         let has_function_call = body_src.contains("function_call (");
 
         // Gas specification only matters for function-call actions and their
