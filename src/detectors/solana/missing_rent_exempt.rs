@@ -173,9 +173,7 @@ impl<'a> RentVisitor<'a> {
     /// A callee of `fn_name` (resolvable in this file) computes the rent-exempt
     /// minimum — e.g. `let lamports = required_lamports(space)?;`.
     fn callee_computes_rent(&self, calls: &[String]) -> bool {
-        calls
-            .iter()
-            .any(|c| self.fn_has_rent.get(c) == Some(&true))
+        calls.iter().any(|c| self.fn_has_rent.get(c) == Some(&true))
     }
 
     /// A caller of `fn_name` (resolvable in this file) computes the rent-exempt

@@ -97,9 +97,7 @@ impl<'ast, 'a> Visit<'ast> for ReentrancyVisitor<'a> {
             // that passes a previously-built ctx variable).
             let anchor_cpi = clean.contains(":: cpi ::")
                 || clean.contains("CpiContext")
-                || pending_ctx_vars
-                    .iter()
-                    .any(|v| uses_var_in_call(&clean, v));
+                || pending_ctx_vars.iter().any(|v| uses_var_in_call(&clean, v));
 
             if native || anchor_cpi {
                 seen_cpi = true;
@@ -141,8 +139,9 @@ fn is_state_mutation(stmt: &Stmt, clean: &str) -> bool {
     // `serialize` / `try_serialize` write bytes back into an account. Exclude
     // `deserialize` / `try_from_slice`, which only *decode* bytes (the original
     // `contains("serialize")` substring-matched "deserialize").
-    let is_serialize_write =
-        clean.contains("serialize") && !clean.contains("deserialize") && !clean.contains("try_from_slice");
+    let is_serialize_write = clean.contains("serialize")
+        && !clean.contains("deserialize")
+        && !clean.contains("try_from_slice");
 
     // --- mutable borrow of account data / lamports ---
     // Restrict to account-data forms; a bare `borrow_mut` on a local RefCell is

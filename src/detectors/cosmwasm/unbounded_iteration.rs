@@ -56,7 +56,10 @@ fn has_cfg_test(attrs: &[Attribute]) -> bool {
             return false;
         }
         let toks = attr.meta.to_token_stream().to_string();
-        toks.chars().filter(|c| !c.is_whitespace()).collect::<String>() == "cfg(test)"
+        toks.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            == "cfg(test)"
     })
 }
 

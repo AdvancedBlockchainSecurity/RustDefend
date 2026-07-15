@@ -6,6 +6,12 @@ use std::process::Command;
 struct CorpusSpec {
     name: &'static str,
     url: &'static str,
+    /// Pinned so upstream changes cannot move the expected ranges out from under CI.
+    /// Bumping a commit means re-measuring `expected_range` against it.
+    commit: &'static str,
+    /// Calibrated against `commit` with the detectors as of this revision. A detector
+    /// change that intentionally shifts these counts must update the range in the
+    /// same commit; an unexplained shift is a recall or precision regression.
     expected_range: (usize, usize),
 }
 
@@ -13,27 +19,41 @@ const CORPUS: &[CorpusSpec] = &[
     CorpusSpec {
         name: "solana-attack-vectors",
         url: "https://github.com/Ackee-Blockchain/solana-common-attack-vectors",
-        expected_range: (3, 20),
+        commit: "ea18da864c980a9a4ea803f588e39224cf2b9594",
+        expected_range: (10, 30),
     },
     CorpusSpec {
         name: "cosmwasm-security-dojo",
         url: "https://github.com/oak-security/cosmwasm-security-dojo",
-        expected_range: (15, 70),
+        commit: "68527006200e269fc8386a3e1b7c4799e2a6cd19",
+        expected_range: (18, 50),
     },
     CorpusSpec {
         name: "scout-audit",
         url: "https://github.com/CoinFabrik/scout-audit",
-        expected_range: (80, 350),
+        commit: "e4bc39272cb4bee93102e080ed5ba1b971f5610b",
+        expected_range: (100, 220),
     },
 ];
 
-fn clone_repo(url: &str, target: &Path) -> bool {
-    Command::new("git")
-        .args(["clone", "--depth", "1", url])
-        .arg(target)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Fetch exactly `commit`. `git clone --depth 1` can only land on a branch tip, so
+/// init + fetch-by-SHA is what actually pins the corpus.
+fn clone_repo(url: &str, commit: &str, target: &Path) -> bool {
+    if std::fs::create_dir_all(target).is_err() {
+        return false;
+    }
+    let git = |args: &[&str]| -> bool {
+        Command::new("git")
+            .current_dir(target)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    git(&["init", "-q"])
+        && git(&["remote", "add", "origin", url])
+        && git(&["fetch", "-q", "--depth", "1", "origin", commit])
+        && git(&["checkout", "-q", "FETCH_HEAD"])
 }
 
 fn run_scan(path: &Path) -> Option<Vec<serde_json::Value>> {
@@ -54,7 +74,10 @@ fn run_scan(path: &Path) -> Option<Vec<serde_json::Value>> {
 
 #[test]
 fn test_corpus_repos() {
-    let tmp_dir = std::env::temp_dir().join("rustdefend_integration_tests");
+    // Must not contain a test-path marker (`test`, `integration_tests`, `mock`):
+    // the scanner skips such paths as an FP filter, which would suppress most
+    // findings in the cloned corpus and make the expected ranges unreachable.
+    let tmp_dir = std::env::temp_dir().join("rustdefend_corpus");
     let _ = std::fs::create_dir_all(&tmp_dir);
 
     for spec in CORPUS {
@@ -63,9 +86,9 @@ fn test_corpus_repos() {
         // Clean up any previous clone
         let _ = std::fs::remove_dir_all(&repo_dir);
 
-        eprintln!("Cloning {}...", spec.name);
-        if !clone_repo(spec.url, &repo_dir) {
-            eprintln!("  SKIP: Failed to clone {}", spec.url);
+        eprintln!("Cloning {} @ {}...", spec.name, &spec.commit[..8]);
+        if !clone_repo(spec.url, spec.commit, &repo_dir) {
+            eprintln!("  SKIP: Failed to clone {} @ {}", spec.url, spec.commit);
             continue;
         }
 

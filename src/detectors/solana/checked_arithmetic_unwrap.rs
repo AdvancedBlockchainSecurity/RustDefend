@@ -99,8 +99,7 @@ impl<'ast> Visit<'ast> for GuardFinder {
         let method = node.method.to_string();
         if method == "is_none" || method == "is_some" {
             if let Some(checked) = checked_call(&node.receiver) {
-                self.guarded
-                    .insert(checked.to_token_stream().to_string());
+                self.guarded.insert(checked.to_token_stream().to_string());
             }
         }
         syn::visit::visit_expr_method_call(self, node);

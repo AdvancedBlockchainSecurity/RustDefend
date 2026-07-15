@@ -207,7 +207,10 @@ fn seed_arg_after_call(context: &str, call_base: &str) -> SeedArg {
     };
     let after = rest[paren..].trim_start();
     // Strip an optional leading reference `&` (possibly followed by whitespace).
-    let after = after.strip_prefix('&').map(|s| s.trim_start()).unwrap_or(after);
+    let after = after
+        .strip_prefix('&')
+        .map(|s| s.trim_start())
+        .unwrap_or(after);
 
     if after.starts_with('[') {
         return SeedArg::InlineArray;
@@ -216,7 +219,8 @@ fn seed_arg_after_call(context: &str, call_base: &str) -> SeedArg {
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    if !ident.is_empty() && after.chars().next().map(|c| c.is_alphabetic() || c == '_') == Some(true)
+    if !ident.is_empty()
+        && after.chars().next().map(|c| c.is_alphabetic() || c == '_') == Some(true)
     {
         return SeedArg::BareIdent(ident);
     }

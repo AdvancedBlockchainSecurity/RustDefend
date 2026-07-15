@@ -177,7 +177,10 @@ fn callees_have_auth(
         }
         if let Some(fn_defs) = defs.get(name) {
             for def in fn_defs {
-                if CALLEE_AUTH_PATTERNS.iter().any(|p| def.body_src.contains(p)) {
+                if CALLEE_AUTH_PATTERNS
+                    .iter()
+                    .any(|p| def.body_src.contains(p))
+                {
                     return true;
                 }
             }

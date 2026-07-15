@@ -254,9 +254,7 @@ fn has_hardcoded_program_id_init(body_src: &str) -> bool {
         let val_start = start + rel + needle.len();
         let rest = &body_src[val_start..];
         // The value expression runs up to the next top-level delimiter.
-        let end = rest
-            .find([',', ';', '}'])
-            .unwrap_or(rest.len());
+        let end = rest.find([',', ';', '}']).unwrap_or(rest.len());
         let value = rest[..end].trim();
         if value_is_const_program_id(value) {
             return true;

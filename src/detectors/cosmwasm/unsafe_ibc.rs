@@ -34,11 +34,7 @@ impl Detector for UnsafeIbcDetector {
     fn detect(&self, ctx: &ScanContext) -> Vec<Finding> {
         // Skip files that live under a `tests/` directory — any IBC handlers there
         // are test scaffolding (e.g. cw-multi-test counterparty mocks), never on-chain.
-        if ctx
-            .file_path
-            .components()
-            .any(|c| c.as_os_str() == "tests")
-        {
+        if ctx.file_path.components().any(|c| c.as_os_str() == "tests") {
             return Vec::new();
         }
 
@@ -121,12 +117,7 @@ const SEND_MESSAGE_PATTERNS: &[&str] = &[
 
 /// Panicking-stub macros (token-stream spelling). A small handler that only
 /// panics processes no packet data and holds no revertible state.
-const PANIC_STUB_PATTERNS: &[&str] = &[
-    "unimplemented !",
-    "unreachable !",
-    "todo !",
-    "panic !",
-];
+const PANIC_STUB_PATTERNS: &[&str] = &["unimplemented !", "unreachable !", "todo !", "panic !"];
 
 struct IbcVisitor<'a> {
     findings: &'a mut Vec<Finding>,

@@ -111,9 +111,7 @@ fn receiver_is_literal_infallible(expr: &Expr) -> bool {
         // with a non-empty, fully-literal argument list. Requiring at least one
         // argument avoids suppressing zero-arg calls like `load_config()` that
         // could read global/chain state internally.
-        Expr::Call(c) => {
-            !c.args.is_empty() && c.args.iter().all(receiver_is_literal_infallible)
-        }
+        Expr::Call(c) => !c.args.is_empty() && c.args.iter().all(receiver_is_literal_infallible),
         _ => false,
     }
 }

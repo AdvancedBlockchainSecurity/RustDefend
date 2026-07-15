@@ -274,9 +274,9 @@ fn is_test_fn(func: &ItemFn) -> bool {
 
 /// Whether an attribute list carries `#[cfg(test)]`.
 fn has_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().is_ident("cfg") && a.meta.to_token_stream().to_string().contains("test")
-    })
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("cfg") && a.meta.to_token_stream().to_string().contains("test"))
 }
 
 #[cfg(test)]

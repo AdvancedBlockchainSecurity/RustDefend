@@ -328,9 +328,7 @@ fn strip_string_literals(src: &str) -> String {
 /// so PascalCase items like an error variant `SignerCheckMissing` do NOT match —
 /// avoiding accidental suppression of a real finding.
 fn body_calls_signer_assert_helper(body: &str) -> bool {
-    const VERBS: [&str; 6] = [
-        "assert", "require", "check", "verify", "validate", "ensure",
-    ];
+    const VERBS: [&str; 6] = ["assert", "require", "check", "verify", "validate", "ensure"];
     for v in VERBS {
         if body.contains(&format!("{}_signer", v)) || body.contains(&format!("{}_is_signer", v)) {
             return true;
