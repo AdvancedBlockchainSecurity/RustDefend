@@ -54,7 +54,10 @@ fn run_scan(path: &Path) -> Option<Vec<serde_json::Value>> {
 
 #[test]
 fn test_corpus_repos() {
-    let tmp_dir = std::env::temp_dir().join("rustdefend_integration_tests");
+    // Must not contain a test-path marker (`test`, `integration_tests`, `mock`):
+    // the scanner skips such paths as an FP filter, which would suppress most
+    // findings in the cloned corpus and make the expected ranges unreachable.
+    let tmp_dir = std::env::temp_dir().join("rustdefend_corpus");
     let _ = std::fs::create_dir_all(&tmp_dir);
 
     for spec in CORPUS {
