@@ -72,20 +72,33 @@ const AUTH_PATTERNS: &[&str] = &[
     "owner",
 ];
 
-/// Stronger auth tokens required inside a *resolved callee* body before we accept
-/// that a delegated helper actually performs authorization. Intentionally excludes
-/// the bare "admin"/"owner" substrings (which also match plain getters/fields) so
-/// that resolving a non-checking helper never silences a real vulnerability.
-const CALLEE_AUTH_PATTERNS: &[&str] = &[
-    "info . sender",
-    "info.sender",
+/// Guard macros whose *condition* may express an authorization check. The macro name
+/// alone is meaningless: `ensure!(fee_bps <= MAX)` bounds an argument, `ensure!(
+/// info.sender == admin)` bounds the caller. Only the latter is authorization, so these
+/// names are just an entry point into inspecting the condition tokens — never a match.
+const GUARD_MACROS: &[&str] = &[
+    "ensure",
+    "ensure_eq",
+    "ensure_ne",
+    "require",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+];
+
+/// Calls that perform an authorization check *on the address handed to them*. Each is
+/// accepted only when the caller's identity is among its arguments: `addr_validate(&
+/// msg.recipient)` validates an arbitrary address and authorizes nothing, whereas
+/// `assert_owner(store, &info.sender)` gates on the caller.
+/// Deliberately excludes name-only gates like `assert_authorized` / `check_permissions`:
+/// a helper *named* like an authorization gate is not one. Such helpers are handled by
+/// resolving and inspecting their bodies instead (see `callees_have_auth`).
+const AUTH_CALLS: &[&str] = &[
     "addr_validate",
-    "ensure !",
-    "ensure!",
-    "require !",
-    "require!",
-    "assert !",
-    "assert!",
+    "assert_admin",
+    "assert_owner",
+    "is_admin",
+    "is_owner",
 ];
 
 /// cw_utils payment-validation calls. A method that validates attached funds and
@@ -93,29 +106,30 @@ const CALLEE_AUTH_PATTERNS: &[&str] = &[
 /// is no privilege for an authorization check to protect.
 const PAYMENT_VALIDATION: &[&str] = &["must_pay", "may_pay", "one_coin"];
 
-/// A resolved function/method definition: its body token text and the names it calls.
-struct FnDef {
-    body_src: String,
+/// A resolved function/method definition: its body AST and the names it calls. The body
+/// is kept as a `&Block` rather than token text so that delegated authorization can be
+/// judged structurally — by what the body *does* — instead of by what it spells.
+struct FnDef<'ast> {
+    block: &'ast syn::Block,
     calls: Vec<String>,
 }
 
 /// Collects every function/method definition in the file, keyed by identifier.
-struct DefCollector {
-    defs: HashMap<String, Vec<FnDef>>,
+struct DefCollector<'ast> {
+    defs: HashMap<String, Vec<FnDef<'ast>>>,
 }
 
-impl DefCollector {
-    fn add(&mut self, name: String, block: &syn::Block) {
-        let body_src = block.to_token_stream().to_string();
+impl<'ast> DefCollector<'ast> {
+    fn add(&mut self, name: String, block: &'ast syn::Block) {
         let calls = collect_call_names(block);
         self.defs
             .entry(name)
             .or_default()
-            .push(FnDef { body_src, calls });
+            .push(FnDef { block, calls });
     }
 }
 
-impl<'ast> Visit<'ast> for DefCollector {
+impl<'ast> Visit<'ast> for DefCollector<'ast> {
     fn visit_item_fn(&mut self, func: &'ast ItemFn) {
         self.add(func.sig.ident.to_string(), &func.block);
         syn::visit::visit_item_fn(self, func);
@@ -125,6 +139,120 @@ impl<'ast> Visit<'ast> for DefCollector {
         self.add(func.sig.ident.to_string(), &func.block);
         syn::visit::visit_impl_item_fn(self, func);
     }
+}
+
+/// True if `src` (token text of a single expression) names the caller's identity.
+/// Authorization is a statement *about the caller*, so a check that never references
+/// the caller cannot be one, whatever it is named.
+fn is_caller_identity_src(src: &str) -> bool {
+    src.contains("info . sender") || src.contains("info.sender")
+}
+
+/// Token-aware ident search, so an alias named `sender` does not match `sender_addr`.
+fn mentions_ident(src: &str, ident: &str) -> bool {
+    src.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|t| t == ident)
+}
+
+/// Local aliases of the caller's identity (`let sender = ctx.info.sender.clone();`).
+/// Real checks routinely compare the alias rather than the original expression, so the
+/// alias has to count as the caller for the structural rules below.
+fn caller_aliases(block: &syn::Block) -> Vec<String> {
+    struct AliasFinder {
+        names: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for AliasFinder {
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let Some(init) = &node.init {
+                if is_caller_identity_src(&init.expr.to_token_stream().to_string()) {
+                    if let syn::Pat::Ident(pat) = &node.pat {
+                        self.names.push(pat.ident.to_string());
+                    }
+                }
+            }
+            syn::visit::visit_local(self, node);
+        }
+    }
+    let mut f = AliasFinder { names: Vec::new() };
+    f.visit_block(block);
+    f.names
+}
+
+/// True if `src` references the caller, either directly or through a local alias.
+fn is_caller(src: &str, aliases: &[String]) -> bool {
+    is_caller_identity_src(src) || aliases.iter().any(|a| mentions_ident(src, a))
+}
+
+/// Structural test for "this body actually authorizes the caller".
+///
+/// The caller's identity must appear in a *load-bearing* position — as an operand of an
+/// equality comparison, inside the condition of a guard macro, or as an argument to a
+/// call that gates on the address it is handed. Presence of an `ensure!`/`assert!` token
+/// proves nothing on its own: `ensure!(fee_bps <= MAX)` is an argument bounds-check, not
+/// an authorization check, and accepting it silences genuinely unprotected exec methods.
+fn block_has_auth_check(block: &syn::Block) -> bool {
+    struct AuthFinder {
+        aliases: Vec<String>,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for AuthFinder {
+        fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+            // `info.sender == admin` / `info.sender != owner` — the caller compared
+            // against a privileged value.
+            if matches!(node.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
+                let left = node.left.to_token_stream().to_string();
+                let right = node.right.to_token_stream().to_string();
+                if is_caller(&left, &self.aliases) || is_caller(&right, &self.aliases) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_binary(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            // Guard-macro conditions are unparsed tokens; inspect what is being
+            // guarded, not that a guard exists.
+            if let Some(seg) = node.path.segments.last() {
+                let name = seg.ident.to_string();
+                if GUARD_MACROS.contains(&name.as_str())
+                    && is_caller(&node.tokens.to_string(), &self.aliases)
+                {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_macro(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+            // `self.admin.assert_admin(deps.as_ref(), &info.sender)?`
+            if AUTH_CALLS.contains(&node.method.to_string().as_str())
+                && is_caller(&node.args.to_token_stream().to_string(), &self.aliases)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+            // `cw_ownable::assert_owner(deps.storage, &info.sender)?`
+            if let syn::Expr::Path(path) = node.func.as_ref() {
+                if let Some(seg) = path.path.segments.last() {
+                    if AUTH_CALLS.contains(&seg.ident.to_string().as_str())
+                        && is_caller(&node.args.to_token_stream().to_string(), &self.aliases)
+                    {
+                        self.found = true;
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+    }
+    let mut f = AuthFinder {
+        aliases: caller_aliases(block),
+        found: false,
+    };
+    f.visit_block(block);
+    f.found
 }
 
 /// Collect the names of all functions/methods called inside a block.
@@ -159,9 +287,10 @@ fn collect_call_names(block: &syn::Block) -> Vec<String> {
 
 const MAX_RESOLVE_DEPTH: usize = 4;
 
-/// Returns true if any resolvable callee (transitively, bounded depth) contains a
-/// real authorization check. Only suppresses when a check is actually *seen* in a
-/// resolved body, so a call chain with no check anywhere still produces a finding.
+/// Returns true if any resolvable callee (transitively, bounded depth) performs a real
+/// authorization check. Only suppresses when a check is actually *seen* doing work in a
+/// resolved body, so a call chain with no check anywhere still produces a finding — and
+/// so does a chain whose helpers merely validate their own arguments.
 fn callees_have_auth(
     defs: &HashMap<String, Vec<FnDef>>,
     calls: &[String],
@@ -177,10 +306,7 @@ fn callees_have_auth(
         }
         if let Some(fn_defs) = defs.get(name) {
             for def in fn_defs {
-                if CALLEE_AUTH_PATTERNS
-                    .iter()
-                    .any(|p| def.body_src.contains(p))
-                {
+                if block_has_auth_check(def.block) {
                     return true;
                 }
             }
@@ -249,13 +375,13 @@ fn is_test_fn(attrs: &[Attribute]) -> bool {
     })
 }
 
-struct SylviaVisitor<'a> {
+struct SylviaVisitor<'a, 'ast> {
     findings: &'a mut Vec<Finding>,
     ctx: &'a ScanContext,
-    defs: &'a HashMap<String, Vec<FnDef>>,
+    defs: &'a HashMap<String, Vec<FnDef<'ast>>>,
 }
 
-impl<'ast, 'a> Visit<'ast> for SylviaVisitor<'a> {
+impl<'ast, 'a> Visit<'ast> for SylviaVisitor<'a, 'ast> {
     fn visit_item_fn(&mut self, func: &'ast ItemFn) {
         // Check if function has #[sv::msg(exec)] attribute
         let has_sv_exec = func.attrs.iter().any(|attr| {
@@ -421,6 +547,85 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "Should still flag when the delegated helper performs no authorization"
+        );
+    }
+
+    // MUST STILL FLAG: the delegated helper only bounds an *argument*. An `ensure!` in a
+    // resolved callee is not authorization unless it ensures something about the caller;
+    // keying on the macro token alone silences this genuinely unprotected exec method
+    // (anyone can redirect every protocol fee payout). Do not weaken this test.
+    #[test]
+    fn test_still_flags_helper_that_only_validates_arguments() {
+        let source = r#"
+            fn validate_fee_bps(fee_bps: Uint128) -> StdResult<()> {
+                ensure!(!fee_bps.is_zero() && fee_bps <= Uint128::new(10_000), StdError::generic_err("fee out of range"));
+                Ok(())
+            }
+
+            #[sv::msg(exec)]
+            fn set_fee_collector(&self, ctx: ExecCtx, new_collector: Addr, fee_bps: Uint128) -> StdResult<Response> {
+                validate_fee_bps(fee_bps)?;
+                self.fee_collector.save(ctx.deps.storage, &new_collector)?;
+                self.fee_bps.save(ctx.deps.storage, &fee_bps)?;
+                Ok(Response::new().add_attribute("action", "set_fee_collector"))
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should still flag when the delegated helper only bounds an argument and never checks the caller"
+        );
+        assert_eq!(findings[0].detector_id, "CW-012");
+        assert!(findings[0].message.contains("set_fee_collector"));
+    }
+
+    // MUST STILL FLAG: a helper *named* like an authorization gate that performs no
+    // caller check. The name is not the check.
+    #[test]
+    fn test_still_flags_helper_named_like_auth_gate() {
+        let source = r#"
+            #[sv::msg(exec)]
+            fn set_rate(&self, ctx: ExecCtx, rate: Uint128) -> StdResult<Response> {
+                self.assert_authorized(&ctx, rate)?;
+                self.rate.save(ctx.deps.storage, &rate)?;
+                Ok(Response::new())
+            }
+
+            fn assert_authorized(&self, ctx: &ExecCtx, rate: Uint128) -> StdResult<()> {
+                ensure!(rate <= Uint128::new(100), StdError::generic_err("rate too high"));
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should still flag a helper named like an auth gate that only checks an argument"
+        );
+    }
+
+    // Counterpart to the two tests above: the same delegated shape, but the helper does
+    // compare the caller. Resolution must still suppress here.
+    #[test]
+    fn test_no_finding_helper_checks_caller_via_alias() {
+        let source = r#"
+            #[sv::msg(exec)]
+            fn set_fee_collector(&self, ctx: ExecCtx, new_collector: Addr) -> StdResult<Response> {
+                self.assert_gov(&ctx)?;
+                self.fee_collector.save(ctx.deps.storage, &new_collector)?;
+                Ok(Response::new())
+            }
+
+            fn assert_gov(&self, ctx: &ExecCtx) -> StdResult<()> {
+                let sender = ctx.info.sender.clone();
+                let gov = self.gov.load(ctx.deps.storage)?;
+                ensure!(sender == gov, StdError::generic_err("unauthorized"));
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag when the resolved helper compares the caller through a local alias"
         );
     }
 

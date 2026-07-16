@@ -32,8 +32,12 @@ impl Detector for CrossContractDetector {
 
         // AST-confirmed call sites: lines that contain a real `.try_invoke(...)`
         // method call. This excludes comments, doc comments, and string literals
-        // that merely mention the identifier (FP idx 1).
-        let ast_call_lines = collect_try_invoke_call_lines(&ctx.ast);
+        // that merely mention the identifier (FP idx 1). The same walk records
+        // the call sites whose Result is structurally consumed by a handler.
+        let CallSites {
+            calls: ast_call_lines,
+            handled: ast_handled_lines,
+        } = collect_try_invoke_call_sites(&ctx.ast);
 
         let lines: Vec<&str> = ctx.source.lines().collect();
 
@@ -49,8 +53,8 @@ impl Detector for CrossContractDetector {
             // call syntax `.try_invoke(` (fallback for calls hidden inside
             // macro token streams that syn does not descend into). Comments and
             // string-only mentions satisfy neither condition.
-            let is_call_site =
-                ast_call_lines.contains(&line_num) || stripped.contains(".try_invoke(");
+            let ast_confirmed = ast_call_lines.contains(&line_num);
+            let is_call_site = ast_confirmed || stripped.contains(".try_invoke(");
             if !is_call_site {
                 continue;
             }
@@ -66,10 +70,20 @@ impl Detector for CrossContractDetector {
                 continue;
             }
 
-            // Result handling tokens present on the call line itself
-            // (`?`, match, unwrap*, expect, is_ok/is_err, and_then, .ok()/.err()/
-            // .map()/map_err) -- FP idx 2.
-            let is_handled = has_handler_token(stripped);
+            // FP idx 2: the Result is consumed on the call line itself. Decided
+            // structurally: the `try_invoke()` node must actually BE the operand
+            // of `?`, of a `match`/`if let` scrutinee, or the receiver of a
+            // Result-consuming adapter (`unwrap*`/`expect*`/`is_ok`/`is_err`/
+            // `map`/`map_err`/`and_then`/`or_else`/`ok`/`err`). Merely spelling
+            // one of those names elsewhere on the line -- e.g. a parameter named
+            // `expected_amount` -- consumes nothing and must not suppress.
+            let is_handled = if ast_confirmed {
+                ast_handled_lines.contains(&line_num)
+            } else {
+                // syn does not descend into macro token streams, so there is no
+                // expression tree for this line; fall back to the textual scan.
+                has_handler_token(stripped)
+            };
 
             // Immediately-following line handles the result.
             let next_line_handled = lines
@@ -119,26 +133,115 @@ impl Detector for CrossContractDetector {
     }
 }
 
-/// Collect the 1-based source lines on which a real `try_invoke` method call
-/// occurs. Comments and string literals never appear here because syn only
-/// yields `ExprMethodCall` nodes for actual calls.
-fn collect_try_invoke_call_lines(file: &syn::File) -> HashSet<usize> {
+/// 1-based source lines of real `try_invoke` call sites, split into every call
+/// site and the subset whose Result is structurally consumed.
+struct CallSites {
+    calls: HashSet<usize>,
+    handled: HashSet<usize>,
+}
+
+/// Names of adapters that actually consume the Result they are called on: they
+/// inspect it, unwrap it, or transform it into a new value. Calling one of these
+/// on a `try_invoke()` result means the outcome is not silently dropped.
+fn is_handler_method(name: &syn::Ident) -> bool {
+    matches!(
+        name.to_string().as_str(),
+        "unwrap"
+            | "unwrap_or"
+            | "unwrap_or_default"
+            | "unwrap_or_else"
+            | "unwrap_err"
+            | "expect"
+            | "expect_err"
+            | "is_ok"
+            | "is_err"
+            | "map"
+            | "map_err"
+            | "and_then"
+            | "or_else"
+            | "ok"
+            | "err"
+    )
+}
+
+/// Strip parentheses/groups to reach the underlying expression.
+fn peel(mut expr: &syn::Expr) -> &syn::Expr {
+    loop {
+        match expr {
+            syn::Expr::Paren(p) => expr = &p.expr,
+            syn::Expr::Group(g) => expr = &g.expr,
+            _ => return expr,
+        }
+    }
+}
+
+/// If `expr` IS a `try_invoke()` method call, return the line it sits on.
+/// Requires the call node itself, not merely a subexpression containing one, so
+/// `foo(x.try_invoke()).unwrap()` does not count as handling the inner call.
+fn try_invoke_call_line(expr: &syn::Expr) -> Option<usize> {
+    match peel(expr) {
+        syn::Expr::MethodCall(mc) if mc.method == "try_invoke" => {
+            Some(mc.method.span().start().line)
+        }
+        _ => None,
+    }
+}
+
+/// Collect real `try_invoke` call sites. Comments and string literals never
+/// appear here because syn only yields `ExprMethodCall` nodes for actual calls.
+/// A call site is recorded as handled only when the AST shows its Result being
+/// consumed in one of the positions Rust actually uses to observe a Result.
+fn collect_try_invoke_call_sites(file: &syn::File) -> CallSites {
     struct Collector {
-        lines: HashSet<usize>,
+        sites: CallSites,
     }
     impl<'ast> Visit<'ast> for Collector {
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
             if node.method == "try_invoke" {
-                self.lines.insert(node.method.span().start().line);
+                self.sites.calls.insert(node.method.span().start().line);
+            }
+            // `<try_invoke()>.is_err()` / `.unwrap()` / `.map(..)` -- the call is
+            // the receiver of an adapter that consumes the Result.
+            if is_handler_method(&node.method) {
+                if let Some(line) = try_invoke_call_line(&node.receiver) {
+                    self.sites.handled.insert(line);
+                }
             }
             syn::visit::visit_expr_method_call(self, node);
         }
+
+        fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+            // `<try_invoke()>?` -- Err is propagated to the caller.
+            if let Some(line) = try_invoke_call_line(&node.expr) {
+                self.sites.handled.insert(line);
+            }
+            syn::visit::visit_expr_try(self, node);
+        }
+
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            // `match <try_invoke()> { .. }` -- both outcomes are inspected.
+            if let Some(line) = try_invoke_call_line(&node.expr) {
+                self.sites.handled.insert(line);
+            }
+            syn::visit::visit_expr_match(self, node);
+        }
+
+        fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+            // `if let Ok(..) = <try_invoke()>` / `while let ..`.
+            if let Some(line) = try_invoke_call_line(&node.expr) {
+                self.sites.handled.insert(line);
+            }
+            syn::visit::visit_expr_let(self, node);
+        }
     }
     let mut collector = Collector {
-        lines: HashSet::new(),
+        sites: CallSites {
+            calls: HashSet::new(),
+            handled: HashSet::new(),
+        },
     };
     collector.visit_file(file);
-    collector.lines
+    collector.sites
 }
 
 /// Return the code portion of a source line, dropping any `//` line comment.
@@ -156,20 +259,61 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Whether the call line already consumes the Result with a recognised handler.
+/// Whether `kw` occurs in `line` as a whole word rather than inside a longer
+/// identifier.
+fn contains_keyword(line: &str, kw: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = line.get(from..).and_then(|s| s.find(kw)) {
+        let pos = from + rel;
+        let end = pos + kw.len();
+        let before_ok = pos == 0
+            || line[..pos]
+                .chars()
+                .next_back()
+                .map_or(true, |c| !is_ident_char(c));
+        let after_ok = line[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !is_ident_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end.max(pos + 1);
+        if from >= line.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Textual fallback for call sites hidden inside macro token streams, where syn
+/// exposes no expression tree to inspect. Matches method-call *syntax*
+/// (`.expect(`) and whole keywords, never bare substrings, so an identifier such
+/// as `expected_amount` is not mistaken for a handler.
 fn has_handler_token(line: &str) -> bool {
-    line.contains('?')
-        || line.contains("match")
-        || line.contains("unwrap")
-        || line.contains("expect")
-        || line.contains("if let")
-        || line.contains("map_err")
-        || line.contains("is_ok")
-        || line.contains("is_err")
-        || line.contains("and_then")
-        || line.contains(".ok(")
-        || line.contains(".err(")
-        || line.contains(".map(")
+    const HANDLER_METHODS: &[&str] = &[
+        "unwrap",
+        "unwrap_or",
+        "unwrap_or_default",
+        "unwrap_or_else",
+        "unwrap_err",
+        "expect",
+        "expect_err",
+        "is_ok",
+        "is_err",
+        "map",
+        "map_err",
+        "and_then",
+        "or_else",
+        "ok",
+        "err",
+    ];
+    if line.contains('?') || contains_keyword(line, "match") || contains_keyword(line, "if let") {
+        return true;
+    }
+    HANDLER_METHODS
+        .iter()
+        .any(|m| line.contains(&format!(".{}(", m)))
 }
 
 /// True when the call is a tail expression or explicit `return`, i.e. the whole
@@ -420,6 +564,52 @@ mod tests {
             findings.is_empty(),
             "tail-expression delegation must not be flagged"
         );
+    }
+
+    // MUST STILL FLAG: the discarded cross-contract transfer is genuinely
+    // vulnerable -- if the callee reverts, the credit is still zeroed and the
+    // funds are lost. The only thing that ever silenced this was a parameter
+    // *named* `expected_amount`, whose "expect" substring tripped the handler
+    // scan. A name is not a check; this must flag.
+    #[test]
+    fn test_still_flags_discarded_invoke_with_handler_named_param() {
+        let source = r#"
+            impl Vault {
+                #[ink(message)]
+                pub fn payout(&mut self, to: AccountId, expected_amount: Balance) {
+                    let _ = self.token.call_mut().transfer(to, expected_amount).try_invoke();
+                    self.credited.insert(to, &0);
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "discarded try_invoke must flag: `expected_amount` is a parameter name, not a check"
+        );
+    }
+
+    // Same bug class for the other handler vocabulary: identifiers that merely
+    // spell `match`/`unwrap`/`is_ok`/`map` consume nothing.
+    #[test]
+    fn test_still_flags_discarded_invoke_with_handler_named_locals() {
+        for ident in ["matched_id", "unwrapped_fee", "is_okay_flag", "mapping_key"] {
+            let source = format!(
+                r#"
+                impl Vault {{
+                    #[ink(message)]
+                    pub fn payout(&mut self, {ident}: Balance) {{
+                        let _ = self.token.call_mut().transfer({ident}).try_invoke();
+                    }}
+                }}
+            "#
+            );
+            let findings = run_detector(&source);
+            assert!(
+                !findings.is_empty(),
+                "discarded try_invoke must flag even with a local named `{ident}`"
+            );
+        }
     }
 
     // Sanity: a genuinely unchecked bound call whose binding is never used is

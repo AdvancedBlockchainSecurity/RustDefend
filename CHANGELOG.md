@@ -4,19 +4,26 @@ All notable changes to RustDefend will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.5.1] - 2026-07-11
+## [0.5.2] - 2026-07-15
+
+Detector precision work (ADV-206) plus the false-negative regressions it introduced (ADV-233), released together. The FP reduction was never published on its own: v0.5.1 was tagged from `2b7d5ff`, which predates it.
 
 ### Fixed
 
-- Reduce false positives across all 61 detectors: 253 empirically-proven FPs eliminated with sound AST-based guards (ADV-206)
+- Restore detection in 26 detectors that the ADV-206 false-positive guards had silenced on genuinely vulnerable code (ADV-233)
+- Guards now key on what code *does*, not what it is *named* or *spelled*. `fn_lower.contains("validate")` treated a helper named `validate_pda_seeds` as a signer check; `body_src.contains("is_signer")` treated a mere mention as a check; `body_has_bound_vocab` treated `v.len().checked_sub(1)` as a bounds check. All replaced with AST-structural analysis (ADV-233)
+- Evaluate `#[cfg(..)]` predicates structurally instead of substring-matching their rendered tokens. `#[cfg(not(test))]` stringifies to `cfg (not (test))`, which contains `"test"` — production-only code was being skipped *as test code*. Affected INK-001, INK-004, NEAR-004, NEAR-005, CW-013 (ADV-233)
+- Reduce false positives across all 61 detectors: 253 empirically-proven FPs eliminated with AST-based guards (ADV-206)
 - Recognize validation delegated to a helper by resolving the callee body via the in-file call graph, not name-based skips (ADV-206)
 - Match parsed tokens instead of raw source so patterns in comments and string literals no longer trigger findings (ADV-206)
 - Skip `#[cfg(test)]` modules and test/mock helpers so non-shipped code is not flagged (ADV-206)
 - Recognize const/literal and floating-point arithmetic operands to avoid spurious integer-overflow findings (ADV-206)
+- `test_corpus_repos` cloned corpora into a path containing `integration_tests`, which the scanner skips as a test-path filter — suppressing ~80% of findings and failing CI for ~4 months (ADV-228)
 
 ### Changed
 
-- Add a should-not-flag regression test for every fixed false positive; suite now 570 tests, 0 failures (ADV-206)
+- Add a must-still-flag regression test per fixed detector, asserting the detector still reports the vulnerability it exists for. The suite was previously ~388 should-not-flag vs ~111 must-still-flag, so a guard that silenced a detector entirely passed CI — which is how ADV-206 regressed 26 detectors with 570 green tests. Suite now 661 tests, 0 failures (ADV-233, ADV-235)
+- Pin integration corpora to exact commits and tighten expected ranges; the old bounds were wide enough to stay green through a catastrophic recall loss (ADV-228)
 
 ## [0.5.0] - 2026-02-17
 

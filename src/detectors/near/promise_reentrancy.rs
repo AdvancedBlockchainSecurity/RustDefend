@@ -1,6 +1,8 @@
 use quote::ToTokens;
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::ItemFn;
+use syn::{Attribute, Block, Expr, ExprBinary, ExprCall, ExprMethodCall, ImplItemFn, ItemFn, Stmt};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -74,21 +76,196 @@ fn contains_ext_call(s: &str) -> bool {
     false
 }
 
-/// True if the promise statement chains a `.then(...)` continuation that
-/// registers a callback on the contract itself (`ext_self::...`, `Self::ext`,
-/// or `ext(env::current_account_id())`). This is the officially recommended
-/// NEAR "deduct-then-promise with rollback callback" idiom (checks-effects-
-/// interactions with failure recovery), not a reentrancy bug.
-fn has_self_rollback_callback(stmt_str: &str) -> bool {
-    let has_then = stmt_str.contains(". then (") || stmt_str.contains(".then(");
-    if !has_then {
+/// A function defined in the file under scan: name, attributes, body.
+type FnDef<'ast> = (String, &'ast [Attribute], &'ast Block);
+
+/// Collects every function defined in the file, free (`fn f()`) or inside an
+/// `impl` block, so a `.then(...)`-registered callback can be resolved to its
+/// definition and judged on what it *does*.
+struct FnDefCollector<'ast> {
+    defs: Vec<FnDef<'ast>>,
+}
+
+impl<'ast> Visit<'ast> for FnDefCollector<'ast> {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        self.defs
+            .push((node.sig.ident.to_string(), &node.attrs, &node.block));
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+        self.defs
+            .push((node.sig.ident.to_string(), &node.attrs, &node.block));
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+}
+
+/// Collects the argument expression of every `.then(...)` method call, i.e. the
+/// continuations a promise chain registers.
+struct ThenArgCollector<'ast> {
+    args: Vec<&'ast Expr>,
+}
+
+impl<'ast> Visit<'ast> for ThenArgCollector<'ast> {
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        if node.method == "then" {
+            if let Some(arg) = node.args.first() {
+                self.args.push(arg);
+            }
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Collects the name of every callee invoked inside an expression: each
+/// method-call name and the tail segment of each call path. For
+/// `ext_self::ext(env::current_account_id()).on_withdraw_done(amount)` this
+/// yields `["ext", "current_account_id", "on_withdraw_done"]` — the candidate
+/// names the `.then(...)` continuation could be routing to.
+struct CalleeNameCollector {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for CalleeNameCollector {
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.names.push(node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if let Expr::Path(path) = &*node.func {
+            if let Some(seg) = path.path.segments.last() {
+                self.names.push(seg.ident.to_string());
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+}
+
+fn callee_names(expr: &Expr) -> Vec<String> {
+    let mut collector = CalleeNameCollector { names: Vec::new() };
+    collector.visit_expr(expr);
+    collector.names
+}
+
+/// True if one operand calls `predecessor_account_id()` and the other calls
+/// `current_account_id()`, i.e. the two accounts are genuinely being compared
+/// *against each other*. Merely mentioning either function (logging the
+/// predecessor, passing the current account into a promise) proves nothing.
+fn is_predecessor_vs_current(left: &Expr, right: &Expr) -> bool {
+    let (l, r) = (callee_names(left), callee_names(right));
+    let pairs = |a: &[String], b: &[String]| {
+        a.iter().any(|n| n == "predecessor_account_id")
+            && b.iter().any(|n| n == "current_account_id")
+    };
+    pairs(&l, &r) || pairs(&r, &l)
+}
+
+/// True if the callback authenticates its caller by actually *comparing*
+/// `env::predecessor_account_id()` against `env::current_account_id()` — the
+/// hand-rolled equivalent of `#[private]`. The two calls must be operands of
+/// the same comparison, whether written as a bare `==` / `!=` (an if-panic
+/// guard) or inside an `assert_eq!` / `require_eq!` / `assert!` condition.
+struct SelfCallerComparison {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for SelfCallerComparison {
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        if matches!(node.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+            && is_predecessor_vs_current(&node.left, &node.right)
+        {
+            self.found = true;
+        }
+        syn::visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        // `assert!` / `require!` / `assert_eq!` bodies are opaque token streams
+        // to syn's visitor, so the comparison inside one is invisible unless the
+        // tokens are parsed back into expressions.
+        let parser = Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+        let Ok(args) = parser.parse2(node.tokens.clone()) else {
+            return;
+        };
+
+        let name = node
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+
+        // `assert_eq!(predecessor, current)` compares its first two arguments
+        // rather than evaluating a comparison expression.
+        if name.ends_with("_eq") {
+            if let (Some(a), Some(b)) = (args.first(), args.iter().nth(1)) {
+                if is_predecessor_vs_current(a, b) {
+                    self.found = true;
+                }
+            }
+        }
+
+        // `assert!(predecessor == current, ..)` / `require!(..)`: the comparison
+        // is an ordinary expression among the arguments.
+        for arg in &args {
+            self.visit_expr(arg);
+        }
+    }
+}
+
+fn compares_predecessor_to_current(block: &Block) -> bool {
+    let mut visitor = SelfCallerComparison { found: false };
+    visitor.visit_block(block);
+    visitor.found
+}
+
+/// True if a promise statement registers a rollback callback that is *verified*
+/// to be self-only, so the deduct-then-promise it guards is the recommended
+/// NEAR idiom rather than a reentrancy bug.
+///
+/// What makes that idiom safe is the callback being `#[private]`: near_bindgen
+/// then rejects every caller except the contract itself, so only a resolved
+/// promise can re-credit state. The safety lives in the callback's definition,
+/// never in how the `.then(...)` chain is spelled — `ext_self::` and
+/// `env::current_account_id()` in the chain only say *where* the continuation
+/// is routed, and an attacker can call an unguarded callback directly without
+/// going through the promise at all. So resolve the callback against the
+/// functions defined in this file and judge it there: suppress only when a
+/// resolved callback is genuinely protected (`#[private]`, or a structural
+/// predecessor-vs-current comparison).
+///
+/// When no named callback resolves to a definition in this file, there is no
+/// evidence either way; stay conservative and suppress, matching the behaviour
+/// the false-positive pass intended for cross-module callbacks.
+fn has_verified_rollback_callback(stmt: &Stmt, file: &syn::File) -> bool {
+    let mut then_args = ThenArgCollector { args: Vec::new() };
+    then_args.visit_stmt(stmt);
+    if then_args.args.is_empty() {
         return false;
     }
-    stmt_str.contains("ext_self")
-        || stmt_str.contains("Self :: ext")
-        || stmt_str.contains("Self::ext")
-        || stmt_str.contains("env :: current_account_id")
-        || stmt_str.contains("env::current_account_id")
+
+    let mut defs = FnDefCollector { defs: Vec::new() };
+    defs.visit_file(file);
+
+    let mut resolved_any = false;
+    for arg in &then_args.args {
+        for name in callee_names(arg) {
+            for (def_name, attrs, block) in &defs.defs {
+                if *def_name != name {
+                    continue;
+                }
+                resolved_any = true;
+                if has_attribute(attrs, "private") || compares_predecessor_to_current(block) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Callback resolved but unguarded => a public credit primitive: fire.
+    // Nothing resolved => unknown: keep the conservative suppression.
+    !resolved_any
 }
 
 impl<'ast, 'a> Visit<'ast> for ReentrancyVisitor<'a> {
@@ -139,11 +316,11 @@ impl<'ast, 'a> Visit<'ast> for ReentrancyVisitor<'a> {
             // Promise after state mutation
             if seen_state_mutation && stmt_has_promise {
                 // Canonical NEAR deduct-then-promise pattern that registers a
-                // #[private] rollback callback via `.then(ext_self::...)` is the
-                // recommended safe idiom, not a reentrancy bug. Do not fire on
-                // this statement; keep scanning in case a later, unprotected
-                // promise exists.
-                if has_self_rollback_callback(&stmt_str) {
+                // rollback callback verified to be #[private] (or equivalently
+                // guarded) is the recommended safe idiom, not a reentrancy bug.
+                // Do not fire on this statement; keep scanning in case a later,
+                // unprotected promise exists.
+                if has_verified_rollback_callback(stmt, &self.ctx.ast) {
                     continue;
                 }
 
@@ -300,6 +477,113 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "Real ext_* call after state mutation must still be flagged"
+        );
+    }
+
+    // MUST STILL FLAG: the probe pattern. The `.then(...)` chain is spelled
+    // exactly like the safe rollback idiom — `ext_self::ext(env::current_account_id())`
+    // — but the callback it registers is defined right here as a plain public
+    // method: no `#[private]`, no caller check. Anyone can invoke
+    // `on_withdraw_done(amount)` directly, without any failed promise, and be
+    // credited; repeating it mints balance. Suppressing on the spelling of the
+    // chain (ADV-206) silenced a genuine, exploitable reentrancy bug.
+    #[test]
+    fn test_still_flags_then_callback_without_private_attr() {
+        let source = r#"
+            fn withdraw(&mut self, amount: u128) -> Promise {
+                assert!(self.balance >= amount, "insufficient balance");
+                self.balance = self.balance - amount;
+                Promise::new(env::predecessor_account_id())
+                    .transfer(amount)
+                    .then(ext_self::ext(env::current_account_id()).on_withdraw_done(amount))
+            }
+
+            fn on_withdraw_done(&mut self, amount: u128) {
+                self.balance = self.balance + amount;
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.message.contains("'withdraw'")),
+            "Deduct-then-promise whose .then() callback is a public, non-#[private] \
+             credit primitive must be flagged"
+        );
+    }
+
+    // MUST STILL FLAG (spelling variant): same registration as above, only
+    // re-spelled `Self::on_withdraw_done(...)`. Suppression must never depend
+    // on how the callback is routed, just on whether it is actually guarded.
+    #[test]
+    fn test_still_flags_unprotected_callback_alternate_spelling() {
+        let source = r#"
+            fn withdraw(&mut self, amount: u128) -> Promise {
+                self.balance = self.balance - amount;
+                Promise::new(env::predecessor_account_id())
+                    .transfer(amount)
+                    .then(Self::on_withdraw_done(amount))
+            }
+
+            fn on_withdraw_done(&mut self, amount: u128) {
+                self.balance = self.balance + amount;
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.message.contains("'withdraw'")),
+            "An unprotected rollback callback must be flagged regardless of spelling"
+        );
+    }
+
+    // FP4 (strong form): the callback is defined here and really is `#[private]`,
+    // so near_bindgen rejects every caller but the contract itself. Genuinely
+    // the recommended idiom. Must NOT flag.
+    #[test]
+    fn test_no_finding_rollback_callback_with_private_attr() {
+        let source = r#"
+            fn withdraw(&mut self, amount: u128) -> Promise {
+                self.balance = self.balance - amount;
+                Promise::new(env::predecessor_account_id())
+                    .transfer(amount)
+                    .then(ext_self::ext(env::current_account_id()).on_withdraw_done(amount))
+            }
+
+            #[private]
+            fn on_withdraw_done(&mut self, amount: u128) {
+                self.balance = self.balance + amount;
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "A #[private] rollback callback is the safe NEAR idiom and must not be flagged"
+        );
+    }
+
+    // FP4 (hand-rolled variant): no `#[private]`, but the callback compares
+    // predecessor against current account — the manual equivalent. Must NOT flag.
+    #[test]
+    fn test_no_finding_rollback_callback_with_caller_check() {
+        let source = r#"
+            fn withdraw(&mut self, amount: u128) -> Promise {
+                self.balance = self.balance - amount;
+                Promise::new(env::predecessor_account_id())
+                    .transfer(amount)
+                    .then(ext_self::ext(env::current_account_id()).on_withdraw_done(amount))
+            }
+
+            fn on_withdraw_done(&mut self, amount: u128) {
+                assert_eq!(
+                    env::predecessor_account_id(),
+                    env::current_account_id(),
+                    "callback is private"
+                );
+                self.balance = self.balance + amount;
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "A callback that structurally checks predecessor == current must not be flagged"
         );
     }
 

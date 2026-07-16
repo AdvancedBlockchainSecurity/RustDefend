@@ -2,9 +2,10 @@ use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
 use crate::scanner::finding::*;
 
-use quote::ToTokens;
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{Attribute, ImplItemFn, ItemFn, ItemMod};
+use syn::{Attribute, ImplItemFn, ItemFn, ItemMod, Meta, MetaList, Token};
 
 pub struct UnhandledPromiseDetector;
 
@@ -71,16 +72,108 @@ impl Detector for UnhandledPromiseDetector {
     }
 }
 
-/// True if `attrs` carries a `#[cfg(test)]` (or `#[cfg(all(test, ...))]`) marker.
-fn has_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg") && {
-            // Token-level check: `test` appears as an identifier inside the cfg.
-            let tokens = attr.meta.to_token_stream().to_string();
-            tokens
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .any(|t| t == "test")
+/// Truth of a `cfg` predicate evaluated under the assignment `test = false` —
+/// i.e. "what does this predicate say about a NON-test (deployed) build?".
+/// Every flag other than `test` (features, target_os, ...) is unresolvable
+/// here, so it is tracked as `Unknown` and never collapses to a skip.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NonTestBuild {
+    /// Predicate is false in every non-test build => the item is test-only.
+    Excluded,
+    /// Predicate holds in every non-test build => the item is deployed.
+    Included,
+    /// Depends on flags we cannot resolve; the item may well be deployed.
+    Unknown,
+}
+
+/// Parse the operands of a `cfg`-style list (`all(a, b)` -> `[a, b]`).
+fn cfg_operands(list: &MetaList) -> Option<Vec<Meta>> {
+    let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+    parser
+        .parse2(list.tokens.clone())
+        .ok()
+        .map(|ops| ops.into_iter().collect())
+}
+
+/// Structurally evaluate a `cfg` predicate with `test` set to false.
+///
+/// This is what distinguishes `#[cfg(test)]` (test-only, safe to skip) from
+/// `#[cfg(not(test))]` (production-only, MUST be scanned). Both mention the
+/// `test` identifier; only the predicate's structure tells them apart.
+fn eval_in_non_test_build(meta: &Meta) -> NonTestBuild {
+    match meta {
+        Meta::Path(path) => {
+            if path.is_ident("test") {
+                NonTestBuild::Excluded
+            } else {
+                NonTestBuild::Unknown
+            }
         }
+        // `feature = "x"`, `target_os = "wasm32"`, ... - unresolvable.
+        Meta::NameValue(_) => NonTestBuild::Unknown,
+        Meta::List(list) => {
+            let operands = match cfg_operands(list) {
+                Some(ops) => ops,
+                None => return NonTestBuild::Unknown,
+            };
+
+            if list.path.is_ident("not") {
+                // `not` takes exactly one operand; anything else is malformed.
+                if operands.len() != 1 {
+                    return NonTestBuild::Unknown;
+                }
+                match eval_in_non_test_build(&operands[0]) {
+                    NonTestBuild::Excluded => NonTestBuild::Included,
+                    NonTestBuild::Included => NonTestBuild::Excluded,
+                    NonTestBuild::Unknown => NonTestBuild::Unknown,
+                }
+            } else if list.path.is_ident("all") {
+                // Conjunction: one false operand excludes the whole item.
+                let mut acc = NonTestBuild::Included;
+                for operand in &operands {
+                    match eval_in_non_test_build(operand) {
+                        NonTestBuild::Excluded => return NonTestBuild::Excluded,
+                        NonTestBuild::Unknown => acc = NonTestBuild::Unknown,
+                        NonTestBuild::Included => {}
+                    }
+                }
+                acc
+            } else if list.path.is_ident("any") {
+                // Disjunction: one true operand includes the whole item.
+                // `any(test, feature = "mock")` stays Unknown - it can still be
+                // compiled into a non-test build via the feature.
+                let mut acc = NonTestBuild::Excluded;
+                for operand in &operands {
+                    match eval_in_non_test_build(operand) {
+                        NonTestBuild::Included => return NonTestBuild::Included,
+                        NonTestBuild::Unknown => acc = NonTestBuild::Unknown,
+                        NonTestBuild::Excluded => {}
+                    }
+                }
+                acc
+            } else {
+                NonTestBuild::Unknown
+            }
+        }
+    }
+}
+
+/// True only if `attrs` gate the item OUT of every non-test build, i.e. the
+/// item exists solely in `cargo test` builds and is never deployed.
+///
+/// Deliberately structural rather than textual: `#[cfg(test)]` and
+/// `#[cfg(not(test))]` spell the same `test` token but mean opposite things,
+/// and only the latter is the deployed code a scanner must never miss.
+fn has_cfg_test(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| match &attr.meta {
+        Meta::List(list) if list.path.is_ident("cfg") => match cfg_operands(list) {
+            // `cfg` carries exactly one predicate.
+            Some(ops) if ops.len() == 1 => {
+                eval_in_non_test_build(&ops[0]) == NonTestBuild::Excluded
+            }
+            _ => false,
+        },
+        _ => false,
     })
 }
 
@@ -271,6 +364,110 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag callback_unwrap text inside a cfg(test) fixture string"
+        );
+    }
+
+    // --- must_still_fire: production code gated behind `#[cfg(not(test))]` ---
+    // `cfg(not(test))` is the DEPLOYED build, not a test fixture. Skipping it
+    // because the `test` token appears inside the cfg silences a real vuln:
+    // the callback panics on a failed ft_transfer, so the optimistic debit in
+    // `withdraw` is never refunded and the user's tokens are destroyed.
+    #[test]
+    fn test_still_flags_callback_unwrap_in_cfg_not_test_module() {
+        let source = r#"
+            use near_sdk::{env, near_bindgen, json_types::U128, AccountId, Promise};
+
+            #[cfg(not(test))]
+            mod live_withdraw {
+                use super::*;
+
+                #[near_bindgen]
+                impl Vault {
+                    pub fn withdraw(&mut self, amount: U128) -> Promise {
+                        let account = env::predecessor_account_id();
+                        let balance = self.balances.get(&account).unwrap_or(0);
+                        self.balances.insert(&account, &(balance - amount.0));
+                        ext_ft::ext(self.token_id.clone())
+                            .ft_transfer(account.clone(), amount, None)
+                            .then(Self::ext(env::current_account_id())
+                                .on_withdraw_complete(account, amount))
+                    }
+
+                    #[private]
+                    pub fn on_withdraw_complete(
+                        &mut self,
+                        #[callback_unwrap] _transfer_ok: (),
+                        account: AccountId,
+                        amount: U128,
+                    ) {
+                        env::log_str("withdrew");
+                    }
+                }
+            }
+
+            #[cfg(test)]
+            mod live_withdraw {
+                use super::*;
+
+                #[near_bindgen]
+                impl Vault {
+                    pub fn withdraw(&mut self, amount: U128) {}
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag callback_unwrap in a #[cfg(not(test))] module - that is deployed code"
+        );
+    }
+
+    // --- must_still_fire: `test` mentioned in a cfg that still ships ---
+    // `any(test, feature = "mock")` compiles into a non-test build whenever the
+    // feature is on, so it cannot be treated as test-only.
+    #[test]
+    fn test_still_flags_callback_unwrap_in_cfg_any_test_or_feature() {
+        let source = r#"
+            use near_sdk::near_bindgen;
+
+            #[cfg(any(test, feature = "mock"))]
+            mod maybe_shipped {
+                #[near_bindgen]
+                impl Oracle {
+                    #[private]
+                    pub fn on_price(&self, #[callback_unwrap] price: U128) -> U128 {
+                        price
+                    }
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag callback_unwrap under any(test, feature) - it can ship"
+        );
+    }
+
+    // --- FP retained: `#[cfg(all(test, ...))]` is still test-only ---
+    #[test]
+    fn test_no_finding_callback_unwrap_in_cfg_all_test_module() {
+        let source = r#"
+            use near_sdk::near_bindgen;
+
+            #[cfg(all(test, feature = "integration"))]
+            mod tests {
+                #[near_bindgen]
+                impl Oracle {
+                    pub fn on_price(&self, #[callback_unwrap] price: U128) -> U128 {
+                        price
+                    }
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag callback_unwrap in a cfg(all(test, ...)) module"
         );
     }
 

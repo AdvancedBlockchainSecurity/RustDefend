@@ -1,6 +1,10 @@
 use quote::ToTokens;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{Attribute, BinOp, Expr, ExprBinary, FnArg, ItemFn, ItemMod, Lit, Local, Pat, Type};
+use syn::{
+    Attribute, BinOp, Block, Expr, ExprBinary, ExprIf, FnArg, ItemFn, ItemMod, Lit, Local, Macro,
+    Pat, Stmt, Token, Type, UnOp,
+};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -46,11 +50,19 @@ impl Detector for IntegerOverflowDetector {
             ctx,
             in_function: false,
             balance_idents: Vec::new(),
-            body_normalized: String::new(),
+            active_guards: Vec::new(),
         };
         visitor.visit_file(&ctx.ast);
         findings
     }
+}
+
+/// A comparison fact `left >= right` proven to hold at the current program
+/// point by a guard that dominates it. Operands are whitespace-stripped token
+/// text so they can be matched against an arithmetic expression's operands.
+struct GuardFact {
+    left: String,
+    right: String,
 }
 
 struct OverflowVisitor<'a> {
@@ -59,9 +71,10 @@ struct OverflowVisitor<'a> {
     in_function: bool,
     /// Identifiers (params / typed let-bindings) whose declared type is Balance/u128.
     balance_idents: Vec<String>,
-    /// Whitespace-stripped token source of the enclosing function body, used to
-    /// detect a dominating comparison guard for subtractions.
-    body_normalized: String,
+    /// Comparison facts established by guards that dominate the current program
+    /// point. Pushed on entry to a guarded scope (or by an already-executed
+    /// `assert!`/early-return in the enclosing block) and popped on scope exit.
+    active_guards: Vec<GuardFact>,
 }
 
 impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
@@ -95,23 +108,53 @@ impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
         if sig_has_balance || !balance_idents.is_empty() {
             let prev_in = self.in_function;
             let prev_ids = std::mem::take(&mut self.balance_idents);
-            let prev_body = std::mem::take(&mut self.body_normalized);
+            let prev_guards = std::mem::take(&mut self.active_guards);
 
             self.in_function = true;
             self.balance_idents = balance_idents;
-            self.body_normalized = strip_ws(&fn_body_source(func));
 
             syn::visit::visit_item_fn(self, func);
 
             self.in_function = prev_in;
             self.balance_idents = prev_ids;
-            self.body_normalized = prev_body;
+            self.active_guards = prev_guards;
         } else {
             // Recurse (e.g. for nested items) but do not flag arithmetic here.
             let prev_in = self.in_function;
             self.in_function = false;
             syn::visit::visit_item_fn(self, func);
             self.in_function = prev_in;
+        }
+    }
+
+    fn visit_block(&mut self, block: &'ast Block) {
+        // Walk statements in execution order. A guard only dominates the
+        // statements that FOLLOW it, so facts are collected after each
+        // statement is visited, and dropped when the block's scope ends.
+        let depth = self.active_guards.len();
+        for stmt in &block.stmts {
+            syn::visit::visit_stmt(self, stmt);
+            self.push_stmt_facts(stmt);
+        }
+        self.active_guards.truncate(depth);
+    }
+
+    fn visit_expr_if(&mut self, i: &'ast ExprIf) {
+        // The condition itself is evaluated unguarded.
+        self.visit_expr(&i.cond);
+
+        // `if a >= b { .. }` proves `a >= b` inside the then-branch only.
+        let depth = self.active_guards.len();
+        self.push_facts(&i.cond, true);
+        self.visit_block(&i.then_branch);
+        self.active_guards.truncate(depth);
+
+        // ...and its negation inside the else-branch.
+        if let Some((_, else_branch)) = &i.else_branch {
+            let depth = self.active_guards.len();
+            self.push_facts(&i.cond, false);
+            self.visit_expr(else_branch);
+            self.active_guards.truncate(depth);
         }
     }
 
@@ -195,26 +238,146 @@ impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
 }
 
 impl<'a> OverflowVisitor<'a> {
-    /// True if the enclosing function body contains a comparison guard relating
-    /// the two operands (e.g. `a >= b`, `b <= a`) — the classic safe
-    /// guard-then-subtract idiom. Works across `if`, `assert!`, and `ensure!`
-    /// because all serialize the comparison into the body token stream.
+    /// True if `left >= right` is proven by a guard that actually dominates this
+    /// program point — the classic safe guard-then-subtract idiom.
+    ///
+    /// Only facts pushed by an ENFORCING construct count: an `assert!`/`ensure!`
+    /// condition, an `if cond { .. }` whose branch encloses this expression, or
+    /// an `if !cond { return .. }` early-return earlier in the same block. A
+    /// comparison that merely appears in the body (e.g. bound to a `let` and
+    /// never acted on) proves nothing and is deliberately not consulted.
     fn has_dominating_guard(&self, left: &Expr, right: &Expr) -> bool {
         let l = strip_ws(&left.to_token_stream().to_string());
         let r = strip_ws(&right.to_token_stream().to_string());
         if l.is_empty() || r.is_empty() {
             return false;
         }
-        let candidates = [
-            format!("{l}>={r}"),
-            format!("{l}>{r}"),
-            format!("{r}<={l}"),
-            format!("{r}<{l}"),
-        ];
-        candidates
+        self.active_guards
             .iter()
-            .any(|c| self.body_normalized.contains(c.as_str()))
+            .any(|g| g.left == l && g.right == r)
     }
+
+    /// Record the comparison facts implied by `cond` holding (`positive`) or by
+    /// `cond` failing (`!positive`), normalised to the form `left >= right`.
+    fn push_facts(&mut self, cond: &Expr, positive: bool) {
+        match cond {
+            Expr::Paren(p) => self.push_facts(&p.expr, positive),
+            Expr::Group(g) => self.push_facts(&g.expr, positive),
+            Expr::Unary(u) if matches!(u.op, UnOp::Not(_)) => self.push_facts(&u.expr, !positive),
+            Expr::Binary(b) => {
+                let l = strip_ws(&b.left.to_token_stream().to_string());
+                let r = strip_ws(&b.right.to_token_stream().to_string());
+                match (&b.op, positive) {
+                    // `a && b` proves both conjuncts; by De Morgan, a failing
+                    // `a || b` disproves both disjuncts.
+                    (BinOp::And(_), true) | (BinOp::Or(_), false) => {
+                        self.push_facts(&b.left, positive);
+                        self.push_facts(&b.right, positive);
+                    }
+                    // `a >= b`, `a > b`, `!(a < b)` and `!(a <= b)` all prove `a >= b`.
+                    (BinOp::Ge(_), true)
+                    | (BinOp::Gt(_), true)
+                    | (BinOp::Lt(_), false)
+                    | (BinOp::Le(_), false) => {
+                        self.active_guards.push(GuardFact { left: l, right: r });
+                    }
+                    // `a <= b`, `a < b`, `!(a > b)` and `!(a >= b)` all prove `b >= a`.
+                    (BinOp::Le(_), true)
+                    | (BinOp::Lt(_), true)
+                    | (BinOp::Gt(_), false)
+                    | (BinOp::Ge(_), false) => {
+                        self.active_guards.push(GuardFact { left: r, right: l });
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Facts that hold for the remainder of a block once `stmt` has executed.
+    fn push_stmt_facts(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Macro(m) => self.push_macro_facts(&m.mac),
+            Stmt::Expr(expr, _) => self.push_expr_stmt_facts(expr),
+            _ => {}
+        }
+    }
+
+    fn push_expr_stmt_facts(&mut self, expr: &Expr) {
+        match expr {
+            // `assert!(a >= b, "..")` / `ensure!(a >= b, Error::X)`.
+            Expr::Macro(m) => self.push_macro_facts(&m.mac),
+            // `ensure!(a >= b, Error::X)?;`
+            Expr::Try(t) => self.push_expr_stmt_facts(&t.expr),
+            // Early-return guard: `if a < b { return Err(..); }` proves `a >= b`
+            // for everything after it. Requires no `else`, and a then-branch
+            // that cannot fall through.
+            Expr::If(i) if i.else_branch.is_none() && block_diverges(&i.then_branch) => {
+                self.push_facts(&i.cond, false);
+            }
+            _ => {}
+        }
+    }
+
+    /// Facts proven by an assertion-style macro whose condition is enforced at
+    /// run time (it panics or returns early when the condition fails).
+    fn push_macro_facts(&mut self, mac: &Macro) {
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        if !matches!(
+            name.as_str(),
+            "assert" | "debug_assert" | "ensure" | "require"
+        ) {
+            return;
+        }
+        if let Some(cond) = macro_first_arg(mac) {
+            self.push_facts(&cond, true);
+        }
+    }
+}
+
+/// Parse a macro's first comma-separated argument as an expression, i.e. the
+/// condition of `assert!(cond, "msg")` / `ensure!(cond, Error::X)`.
+fn macro_first_arg(mac: &Macro) -> Option<Expr> {
+    mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        .ok()
+        .and_then(|args| args.into_iter().next())
+}
+
+/// True if the block cannot fall through to the code following its enclosing
+/// `if` — it returns, breaks, continues, or panics.
+fn block_diverges(block: &Block) -> bool {
+    match block.stmts.last() {
+        Some(Stmt::Expr(expr, _)) => expr_diverges(expr),
+        Some(Stmt::Macro(m)) => is_diverging_macro(&m.mac),
+        _ => false,
+    }
+}
+
+fn expr_diverges(expr: &Expr) -> bool {
+    match expr {
+        Expr::Return(_) | Expr::Break(_) | Expr::Continue(_) => true,
+        Expr::Macro(m) => is_diverging_macro(&m.mac),
+        _ => false,
+    }
+}
+
+fn is_diverging_macro(mac: &Macro) -> bool {
+    mac.path
+        .segments
+        .last()
+        .map(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "panic" | "unreachable" | "todo" | "unimplemented"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Remove all whitespace from a string (for structural token matching).
@@ -441,6 +604,106 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "Unguarded Balance subtraction must still be flagged"
+        );
+    }
+
+    // REGRESSION (INK-002 false negative): a comparison bound to a `let` and
+    // never enforced is advisory only — the subtraction still executes on every
+    // path and still underflows. Naming the comparison must not silence us.
+    #[test]
+    fn test_still_flags_advisory_comparison_subtraction() {
+        let source = r#"
+            // #[ink(message)]
+            fn apply_withdrawal(balance: Balance, amount: Balance) -> (Balance, bool) {
+                // Audit flag for the Withdrawn event. Advisory only.
+                let sufficient = balance >= amount;
+                let remaining = balance - amount;
+                (remaining, sufficient)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Unenforced `let sufficient = balance >= amount` must not suppress the \
+             underflowing subtraction"
+        );
+    }
+
+    // The guard must dominate: a check performed AFTER the subtraction is too late.
+    #[test]
+    fn test_still_flags_subtraction_before_guard() {
+        let source = r#"
+            // #[ink(message)]
+            fn debit(balance: Balance, amount: Balance) -> Balance {
+                let remaining = balance - amount;
+                assert!(balance >= amount, "insufficient balance");
+                remaining
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A guard after the subtraction does not dominate it and must not suppress"
+        );
+    }
+
+    // A guard confined to an unrelated branch does not dominate the subtraction.
+    #[test]
+    fn test_still_flags_guard_in_other_branch() {
+        let source = r#"
+            // #[ink(message)]
+            fn debit(balance: Balance, amount: Balance, fee_only: bool) -> Balance {
+                if balance >= amount {
+                    return balance;
+                }
+                balance - amount
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Subtraction on the path where `balance >= amount` is FALSE must be flagged"
+        );
+    }
+
+    // FP1 (structural): early-return guard dominating the subtraction.
+    #[test]
+    fn test_no_finding_early_return_guard() {
+        let source = r#"
+            // #[ink(message)]
+            fn debit(balance: Balance, amount: Balance) -> Result<Balance, Error> {
+                if balance < amount {
+                    return Err(Error::InsufficientFunds);
+                }
+                Ok(balance - amount)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag subtraction behind an early-return guard, got: {:?}",
+            findings
+        );
+    }
+
+    // FP1 (structural): subtraction enclosed by the guarded branch.
+    #[test]
+    fn test_no_finding_if_branch_guard() {
+        let source = r#"
+            // #[ink(message)]
+            fn debit(balance: Balance, amount: Balance) -> Balance {
+                if balance >= amount {
+                    balance - amount
+                } else {
+                    0
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag subtraction inside an `if a >= b` branch, got: {:?}",
+            findings
         );
     }
 

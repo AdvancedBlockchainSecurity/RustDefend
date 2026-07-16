@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use quote::ToTokens;
 use syn::visit::Visit;
-use syn::{Expr, ItemFn, Stmt};
+use syn::{Expr, ItemFn, Pat, Stmt};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -163,6 +165,207 @@ fn scan_expr(expr: &Expr, seen_save: bool) -> (bool, bool) {
     }
 }
 
+/// Names bound by a pattern (`let hook = ...`, `let Foo { a, b } = ...`, ...).
+fn collect_pat_idents(pat: &Pat, out: &mut Vec<String>) {
+    match pat {
+        Pat::Ident(i) => {
+            out.push(i.ident.to_string());
+            if let Some((_, sub)) = &i.subpat {
+                collect_pat_idents(sub, out);
+            }
+        }
+        Pat::Type(t) => collect_pat_idents(&t.pat, out),
+        Pat::Reference(r) => collect_pat_idents(&r.pat, out),
+        Pat::Tuple(t) => t.elems.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::TupleStruct(t) => t.elems.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::Struct(s) => s
+            .fields
+            .iter()
+            .for_each(|f| collect_pat_idents(&f.pat, out)),
+        _ => {}
+    }
+}
+
+/// True when `expr` is the storage handle operand (`deps.storage`, `storage`,
+/// `&deps.storage`, ...) rather than a key or a value.
+fn is_storage_handle(expr: &Expr) -> bool {
+    match expr {
+        Expr::Reference(r) => is_storage_handle(&r.expr),
+        Expr::Field(f) => matches!(&f.member, syn::Member::Named(i) if i == "storage"),
+        Expr::Path(p) => p.path.is_ident("storage"),
+        _ => false,
+    }
+}
+
+/// True when `expr` mentions any of `names` as a bare identifier operand.
+fn expr_uses_any_ident(expr: &Expr, names: &HashSet<String>) -> bool {
+    struct V<'a> {
+        names: &'a HashSet<String>,
+        found: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(id) = node.path.get_ident() {
+                if self.names.contains(&id.to_string()) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+    let mut v = V {
+        names,
+        found: false,
+    };
+    v.visit_expr(expr);
+    v.found
+}
+
+/// Every `let` binding in the function, with its initializer.
+fn collect_locals<'ast>(func: &'ast ItemFn) -> Vec<(Vec<String>, &'ast Expr)> {
+    struct V<'ast> {
+        locals: Vec<(Vec<String>, &'ast Expr)>,
+    }
+    impl<'ast> Visit<'ast> for V<'ast> {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let Some(init) = &local.init {
+                let mut names = Vec::new();
+                collect_pat_idents(&local.pat, &mut names);
+                if !names.is_empty() {
+                    self.locals.push((names, init.expr.as_ref()));
+                }
+            }
+            syn::visit::visit_local(self, local);
+        }
+    }
+    let mut v = V { locals: Vec::new() };
+    v.visit_block(&func.block);
+    v.locals
+}
+
+/// Identifiers carrying caller-supplied data: the function's own parameters,
+/// plus (to a fixpoint) any local whose initializer is computed from one.
+fn message_derived_idents(func: &ItemFn, locals: &[(Vec<String>, &Expr)]) -> HashSet<String> {
+    let mut derived = HashSet::new();
+    for arg in &func.sig.inputs {
+        if let syn::FnArg::Typed(t) = arg {
+            let mut names = Vec::new();
+            collect_pat_idents(&t.pat, &mut names);
+            derived.extend(names);
+        }
+    }
+    // Propagate through `let` bindings until stable, so a key that is copied or
+    // reshaped on the way to the lookup is still recognised as caller-supplied.
+    loop {
+        let mut changed = false;
+        for (names, init) in locals {
+            if names.iter().all(|n| derived.contains(n)) {
+                continue;
+            }
+            if expr_uses_any_ident(init, &derived) {
+                for n in names {
+                    changed |= derived.insert(n.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    derived
+}
+
+/// True when `expr` performs a storage read keyed by caller-supplied data, i.e.
+/// `MAP.load(deps.storage, &key)` / `.may_load(...)` where `key` is message
+/// derived. A keyless read (`CONFIG.load(deps.storage)`) is a global the admin
+/// controls, not an entry the caller registered, and does not qualify.
+fn is_caller_keyed_storage_read(expr: &Expr, msg_derived: &HashSet<String>) -> bool {
+    struct V<'a> {
+        msg: &'a HashSet<String>,
+        found: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let m = node.method.to_string();
+            if m == "load" || m == "may_load" {
+                let mut args = node.args.iter();
+                if args.next().is_some_and(is_storage_handle)
+                    && args.any(|k| expr_uses_any_ident(k, self.msg))
+                {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut v = V {
+        msg: msg_derived,
+        found: false,
+    };
+    v.visit_expr(expr);
+    v.found
+}
+
+/// True when the function builds a `WasmMsg::Execute` whose `contract_addr`
+/// operand is one of `callees` -- an address read out of a storage map under a
+/// caller-supplied key. That callee is arbitrary code the caller registered, so
+/// dispatching to it hands control to an untrusted contract.
+///
+/// Structural on purpose: the callee must appear as the actual `contract_addr`
+/// field operand, not merely be mentioned somewhere in the body.
+fn dispatches_to_registered_callee(func: &ItemFn, callees: &HashSet<String>) -> bool {
+    struct V<'a> {
+        callees: &'a HashSet<String>,
+        found: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+            let is_wasm_execute = node
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "Execute")
+                && node.path.segments.iter().any(|s| s.ident == "WasmMsg");
+            if is_wasm_execute {
+                for field in &node.fields {
+                    if matches!(&field.member, syn::Member::Named(i) if i == "contract_addr")
+                        && expr_uses_any_ident(&field.expr, self.callees)
+                    {
+                        self.found = true;
+                    }
+                }
+            }
+            syn::visit::visit_expr_struct(self, node);
+        }
+    }
+    let mut v = V {
+        callees,
+        found: false,
+    };
+    v.visit_block(&func.block);
+    v.found
+}
+
+/// True when the function dispatches to a contract address that the caller
+/// registered in storage. This is the ibc-hooks re-entry class recognised by
+/// what the code *does* -- read a callee out of a caller-keyed map, then call
+/// it -- rather than by how the entry point happens to be named.
+fn dispatches_to_caller_registered_hook(func: &ItemFn) -> bool {
+    let locals = collect_locals(func);
+    let msg_derived = message_derived_idents(func, &locals);
+
+    let mut hook_addrs = HashSet::new();
+    for (names, init) in &locals {
+        if is_caller_keyed_storage_read(init, &msg_derived) {
+            hook_addrs.extend(names.iter().cloned());
+        }
+    }
+    if hook_addrs.is_empty() {
+        return false;
+    }
+    dispatches_to_registered_callee(func, &hook_addrs)
+}
+
 impl<'ast, 'a> Visit<'ast> for ReentrancyVisitor<'a> {
     fn visit_item_fn(&mut self, func: &'ast ItemFn) {
         let fn_name = func.sig.ident.to_string();
@@ -213,7 +416,19 @@ impl<'ast, 'a> Visit<'ast> for ReentrancyVisitor<'a> {
             || body_src.contains("IbcChannel")
             || body_src.contains("IbcTimeout");
 
-        if !is_ibc_relevant {
+        // The name/type test above is spelling-based, so it misses the ibc-hooks
+        // entry points that motivated the guard in the first place: the wasmd
+        // ibc-hooks module executes an ordinary `execute_*` handler during packet
+        // delivery, with the packet fields already decoded out of the memo into
+        // plain `String`/`Uint128` arguments. Such a handler is a genuine IBC
+        // entry point while carrying no `ibc_` prefix and no `Ibc*` type.
+        //
+        // Recognise that class structurally instead: the handler reads a callee
+        // address out of a storage map under a caller-supplied key and then
+        // dispatches `WasmMsg::Execute` to it. Handing control to a contract the
+        // caller registered is what makes the write-before-dispatch ordering
+        // matter, whatever the function is called.
+        if !is_ibc_relevant && !dispatches_to_caller_registered_hook(func) {
             return;
         }
 
@@ -389,6 +604,71 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag save and dispatch that occur in mutually exclusive match arms"
+        );
+    }
+
+    // MUST STILL FLAG: an ibc-hooks entry point. The wasmd ibc-hooks module runs
+    // this handler during packet delivery, so it is a real IBC entry point even
+    // though it is not named `ibc_*` and never names an `Ibc*` type -- the packet
+    // fields arrive pre-decoded from the memo as plain arguments. It credits the
+    // account (`finalized: false`) and only then calls the depositor's registered
+    // hook, which is attacker-chosen code that re-enters the withdraw path before
+    // the packet's finalize step runs.
+    //
+    // Renaming this function to `ibc_packet_receive` -- changing nothing it does
+    // -- makes it fire. That the detector's answer ever depended on the name is
+    // the regression this test pins. Do not re-narrow the guard to a name test.
+    #[test]
+    fn test_still_flags_ibc_hooks_entry_point_dispatching_to_registered_hook() {
+        let source = r#"
+            pub fn execute_receive_from_ibc(
+                deps: DepsMut,
+                _env: Env,
+                _info: MessageInfo,
+                depositor: String,
+                amount: Uint128,
+            ) -> StdResult<Response> {
+                let hook = HOOKS.load(deps.storage, &depositor)?;
+                ACCOUNTS.save(
+                    deps.storage,
+                    &depositor,
+                    &Account { credited: amount, finalized: false },
+                )?;
+                Ok(Response::new().add_message(WasmMsg::Execute {
+                    contract_addr: hook.to_string(),
+                    msg: to_json_binary(&NotifyMsg::Credited { amount })?,
+                    funds: vec![],
+                }))
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag an ibc-hooks entry point that saves before dispatching to a \
+             caller-registered hook, regardless of the function's name"
+        );
+    }
+
+    // Boundary of the caller-registered-hook branch: a keyless `CONFIG.load` is a
+    // global the admin controls, not an entry the caller registered, so calling
+    // the configured token contract after a save stays silent.
+    #[test]
+    fn test_no_finding_dispatch_to_admin_configured_address() {
+        let source = r#"
+            pub fn execute_stake(deps: DepsMut, env: Env, info: MessageInfo, amount: Uint128) -> StdResult<Response> {
+                let cfg = CONFIG.load(deps.storage)?;
+                STAKES.save(deps.storage, &info.sender, &amount)?;
+                Ok(Response::new().add_message(WasmMsg::Execute {
+                    contract_addr: cfg.token.to_string(),
+                    msg: to_json_binary(&Cw20ExecuteMsg::Transfer { amount })?,
+                    funds: vec![],
+                }))
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag dispatch to an admin-configured address read without a caller key"
         );
     }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use syn::visit::Visit;
 use syn::{Attribute, Block, Expr, ExprCall, ExprMethodCall, ItemFn, ItemMod, Member};
@@ -99,10 +99,14 @@ impl<'ast, 'a> Visit<'ast> for PdaVisitor<'a> {
         }
 
         // Only flag when at least one create_program_address call uses a bump
-        // that is NOT sourced from program-owned account state. A bump read from
-        // an account field (`vault.bump`, `ctx.accounts.x.bump`) or `ctx.bumps`
-        // is canonical-by-construction and safe to re-derive with.
-        let has_unsafe_bump = cpa_calls.iter().any(|c| !call_uses_stored_bump(c));
+        // that is NOT sourced from program-owned account state. Provenance is
+        // resolved structurally from the `let` bindings in the body: a field
+        // named `bump` is only canonical-by-construction when its base actually
+        // roots at `ctx.accounts`/`ctx.bumps` (or a local aliasing that state).
+        // A `bump` field on a Borsh-decoded instruction-data struct spells the
+        // same but is fully attacker-controlled, so it must still flag.
+        let prov = collect_bump_provenance(&func.block);
+        let has_unsafe_bump = cpa_calls.iter().any(|c| !call_uses_stored_bump(c, &prov));
         if !has_unsafe_bump {
             return;
         }
@@ -195,33 +199,190 @@ fn collect_cpa_calls(block: &Block) -> Vec<Expr> {
     v.calls
 }
 
-/// Returns true if the given call expression sources its bump from program-owned
-/// account state: a field access whose member is `bump`/`bumps` (e.g.
-/// `vault.bump`, `ctx.accounts.vault.bump`, `ctx.bumps.vault`) or an accessor
-/// method `.bump()`/`.bumps()`. These bumps are canonical-by-construction.
-fn call_uses_stored_bump(expr: &Expr) -> bool {
-    struct V {
+/// Provenance facts about the locals of a single function body, derived from
+/// its `let` initializers. Neither set is keyed on how an identifier is spelled.
+#[derive(Default)]
+struct BumpProvenance {
+    /// Locals whose value is drawn from program-owned account state, so that
+    /// `vault.bump` after `let vault = &ctx.accounts.vault;` resolves.
+    account_locals: HashSet<String>,
+    /// Locals bound to a bump that is itself sourced from account state, so
+    /// that `let bump = ctx.bumps.vault;` followed by `&[bump]` resolves.
+    stored_bump_locals: HashSet<String>,
+}
+
+/// Strip references, dereferences, parens and groups to reach the underlying
+/// place expression.
+fn peel(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Reference(r) => peel(&r.expr),
+        Expr::Paren(p) => peel(&p.expr),
+        Expr::Group(g) => peel(&g.expr),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => peel(&u.expr),
+        _ => expr,
+    }
+}
+
+/// Walk the base chain of a place expression down to its root identifier.
+/// Returns `(root_ident, passes_through_account_state)`, where the flag records
+/// whether any link in the chain is Anchor's `accounts` or `bumps` member.
+fn place_root(expr: &Expr) -> Option<(String, bool)> {
+    match peel(expr) {
+        Expr::Path(p) => p.path.get_ident().map(|i| (i.to_string(), false)),
+        Expr::Field(f) => {
+            let via = matches!(&f.member, Member::Named(id) if id == "accounts" || id == "bumps");
+            place_root(&f.base).map(|(root, seen)| (root, seen || via))
+        }
+        Expr::MethodCall(m) => place_root(&m.receiver),
+        Expr::Index(i) => place_root(&i.expr),
+        Expr::Try(t) => place_root(&t.expr),
+        _ => None,
+    }
+}
+
+/// Returns true if the place `base` denotes program-owned account state: an
+/// Anchor `ctx.accounts.*` / `ctx.bumps.*` chain, or a local aliasing one.
+/// `via_self` lets the caller fold the member it is inspecting into the chain
+/// (so the `bumps` in `ctx.bumps` counts even though it is the outermost link).
+fn base_is_account_state(base: &Expr, via_self: bool, account_locals: &HashSet<String>) -> bool {
+    match place_root(base) {
+        Some((root, via)) => (root == "ctx" && (via || via_self)) || account_locals.contains(&root),
+        None => false,
+    }
+}
+
+/// Whether `expr` draws any of its value from program-owned account state.
+/// Deliberately a "contains" check so that account data reached through a
+/// deserializer (`Vault::try_from_slice(&ctx.accounts.vault.data.borrow())`)
+/// still counts as account-sourced.
+fn expr_draws_from_account_state(expr: &Expr, account_locals: &HashSet<String>) -> bool {
+    if base_is_account_state(peel(expr), false, account_locals) {
+        return true;
+    }
+    struct V<'a> {
+        account_locals: &'a HashSet<String>,
         found: bool,
     }
-    impl<'ast> Visit<'ast> for V {
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+            let via_self =
+                matches!(&node.member, Member::Named(id) if id == "accounts" || id == "bumps");
+            if base_is_account_state(&node.base, via_self, self.account_locals) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_field(self, node);
+        }
+    }
+    let mut v = V {
+        account_locals,
+        found: false,
+    };
+    v.visit_expr(expr);
+    v.found
+}
+
+/// Classify every bump read inside `expr` by provenance, returning
+/// `(has_stored, has_unstored)`. A bump read is a field/method access named
+/// `bump`/`bumps`; it is *stored* only when its base resolves to account state.
+/// A bare identifier counts as stored only when a `let` bound it to a stored
+/// bump — an unknown identifier is never evidence of safety.
+fn classify_bump_reads(expr: &Expr, prov: &BumpProvenance) -> (bool, bool) {
+    struct V<'a> {
+        prov: &'a BumpProvenance,
+        stored: bool,
+        unstored: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
         fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
             if let Member::Named(id) = &node.member {
                 if id == "bump" || id == "bumps" {
-                    self.found = true;
+                    if base_is_account_state(&node.base, id == "bumps", &self.prov.account_locals) {
+                        self.stored = true;
+                    } else {
+                        self.unstored = true;
+                    }
                 }
             }
             syn::visit::visit_expr_field(self, node);
         }
         fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
             if node.method == "bump" || node.method == "bumps" {
-                self.found = true;
+                if base_is_account_state(&node.receiver, false, &self.prov.account_locals) {
+                    self.stored = true;
+                } else {
+                    self.unstored = true;
+                }
             }
             syn::visit::visit_expr_method_call(self, node);
         }
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(id) = node.path.get_ident() {
+                if self.prov.stored_bump_locals.contains(&id.to_string()) {
+                    self.stored = true;
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
     }
-    let mut v = V { found: false };
+    let mut v = V {
+        prov,
+        stored: false,
+        unstored: false,
+    };
     v.visit_expr(expr);
-    v.found
+    (v.stored, v.unstored)
+}
+
+/// The binding name introduced by a simple `let` pattern, if any.
+fn local_binding_ident(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(i) => Some(i.ident.to_string()),
+        syn::Pat::Type(t) => local_binding_ident(&t.pat),
+        _ => None,
+    }
+}
+
+/// Resolve, in source order, which locals alias account state and which hold a
+/// bump sourced from it. Rebinding a name to a non-account value retracts the
+/// earlier fact, so shadowing cannot launder an attacker-controlled bump.
+fn collect_bump_provenance(block: &Block) -> BumpProvenance {
+    struct V {
+        prov: BumpProvenance,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            syn::visit::visit_local(self, node);
+            if let Some(name) = local_binding_ident(&node.pat) {
+                if let Some(init) = node.init.as_ref() {
+                    if expr_draws_from_account_state(&init.expr, &self.prov.account_locals) {
+                        self.prov.account_locals.insert(name.clone());
+                    } else {
+                        self.prov.account_locals.remove(&name);
+                    }
+                    let (stored, unstored) = classify_bump_reads(&init.expr, &self.prov);
+                    if stored && !unstored {
+                        self.prov.stored_bump_locals.insert(name);
+                    } else {
+                        self.prov.stored_bump_locals.remove(&name);
+                    }
+                }
+            }
+        }
+    }
+    let mut v = V {
+        prov: BumpProvenance::default(),
+    };
+    v.visit_block(block);
+    v.prov
+}
+
+/// Returns true if the given call expression sources its bump from program-owned
+/// account state, and from nowhere else. Requires positive evidence: a bump read
+/// whose base actually roots at `ctx.accounts`/`ctx.bumps` or a local aliasing
+/// that state. A call mixing a stored bump with an unstored one stays unsafe.
+fn call_uses_stored_bump(expr: &Expr, prov: &BumpProvenance) -> bool {
+    let (stored, unstored) = classify_bump_reads(expr, prov);
+    stored && !unstored
 }
 
 /// Returns true if the block references Anchor's `ctx.bumps` (any field access
@@ -308,6 +469,82 @@ mod tests {
         "#;
         let findings = run_detector(source);
         assert!(!findings.is_empty(), "Should detect user-provided bump");
+    }
+
+    // MUST STILL FLAG: the bump arrives on a Borsh-decoded instruction-data
+    // struct. `params.bump` spells exactly like a stored account bump but is
+    // raw attacker-controlled input: create_program_address accepts any
+    // off-curve bump, so a ground non-canonical bump yields an alternate valid
+    // authority. Provenance, not the field name, is what makes a bump safe.
+    #[test]
+    fn test_still_flags_instruction_data_struct_bump() {
+        let source = r#"
+            pub fn withdraw(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
+                let owner_key = ctx.accounts.owner.key();
+                let authority = Pubkey::create_program_address(
+                    &[b"vault-authority", owner_key.as_ref(), &[params.bump]],
+                    ctx.program_id,
+                )
+                .map_err(|_| error!(VaultError::InvalidAuthority))?;
+                require_keys_eq!(
+                    authority,
+                    ctx.accounts.vault_authority.key(),
+                    VaultError::InvalidAuthority
+                );
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert_eq!(
+            findings.len(),
+            1,
+            "Should flag a bump read from instruction data even though the field is named `bump`"
+        );
+    }
+
+    // MUST STILL FLAG: renaming the field must not change the verdict. This is
+    // the single-token pin from the audit — the probe and this variant differ
+    // only in spelling, so they must agree.
+    #[test]
+    fn test_still_flags_instruction_data_bump_regardless_of_field_name() {
+        let renamed = r#"
+            pub fn withdraw(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
+                let addr = Pubkey::create_program_address(
+                    &[b"vault-authority", &[params.seed_bump]],
+                    ctx.program_id,
+                )?;
+                Ok(())
+            }
+        "#;
+        let original = renamed.replace("seed_bump", "bump");
+        assert_eq!(
+            run_detector(&original).len(),
+            run_detector(renamed).len(),
+            "Verdict must not depend on whether the field is spelled `bump` or `seed_bump`"
+        );
+        assert_eq!(run_detector(&original).len(), 1, "Both must flag");
+    }
+
+    // MUST STILL FLAG: a stored bump does not launder an attacker-controlled
+    // one used in the same derivation.
+    #[test]
+    fn test_still_flags_mixed_stored_and_user_bump() {
+        let source = r#"
+            fn withdraw(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
+                let vault = &ctx.accounts.vault;
+                let addr = Pubkey::create_program_address(
+                    &[b"vault", &[vault.bump], &[params.bump]],
+                    ctx.program_id,
+                )?;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert_eq!(
+            findings.len(),
+            1,
+            "A call mixing a stored bump with a user-provided bump is still unsafe"
+        );
     }
 
     #[test]

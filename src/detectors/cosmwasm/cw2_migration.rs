@@ -1,6 +1,7 @@
 use quote::ToTokens;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{ItemFn, ItemMod};
+use syn::{Attribute, ItemFn, ItemMod, Meta, Token};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -85,6 +86,59 @@ fn body_performs_migration(body_src: &str) -> bool {
         || body_src.contains("Ok")
 }
 
+/// Structurally evaluates a single `cfg` predicate and returns true only if the
+/// predicate *requires* `test` to be enabled — i.e. the gated item cannot exist
+/// in a non-test build.
+///
+/// The cfg predicate grammar (`test`, `all(..)`, `any(..)`, `not(..)`,
+/// `feature = ".."`) maps exactly onto `syn::Meta`, so we walk it as an AST
+/// rather than substring-matching the rendered tokens. Substring matching is
+/// what made `#[cfg(not(test))]` — the *production* wasm gate — look test-only.
+///
+/// Errs toward returning false (descend and flag): a predicate we cannot prove
+/// is test-exclusive is treated as production code, so no real bug is silently
+/// suppressed.
+fn cfg_requires_test(meta: &Meta) -> bool {
+    match meta {
+        // Bare `test`.
+        Meta::Path(path) => path.is_ident("test"),
+        // `feature = "testing"`, `target_os = "..."` — a cfg *option*, never
+        // the `test` cfg itself, however its value happens to be spelled.
+        Meta::NameValue(_) => false,
+        Meta::List(list) => {
+            let Ok(nested) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                // `all(test, ..)` holds only in test builds.
+                nested.iter().any(cfg_requires_test)
+            } else if list.path.is_ident("any") {
+                // `any(test, feature = "x")` also holds in a non-test build
+                // with `x` on, so it is test-exclusive only if every arm is.
+                !nested.is_empty() && nested.iter().all(cfg_requires_test)
+            } else {
+                // `not(test)` is the production gate, and an unknown predicate
+                // proves nothing. Neither is test-exclusive.
+                false
+            }
+        }
+    }
+}
+
+/// Returns true if these attributes gate the item to test builds only.
+fn is_cfg_test_only(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        match attr.parse_args::<Meta>() {
+            Ok(meta) => cfg_requires_test(&meta),
+            Err(_) => false,
+        }
+    })
+}
+
 struct MigrationVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     ctx: &'a ScanContext,
@@ -92,11 +146,13 @@ struct MigrationVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for MigrationVisitor<'a> {
     fn visit_item_mod(&mut self, module: &'ast ItemMod) {
-        // Do not descend into #[cfg(test)] modules: their contents are never
+        // Do not descend into test-only modules: their contents are never
         // compiled into the contract wasm, so test scaffolding (e.g. a
         // `migrate_*` setup helper) must not be flagged as production
-        // migration code.
-        if has_attribute_with_value(&module.attrs, "cfg", "test") {
+        // migration code. The gate must be evaluated structurally — the
+        // inverse gate `#[cfg(not(test))]` marks the *production* wasm
+        // exports and must still be descended into.
+        if is_cfg_test_only(&module.attrs) {
             return;
         }
         syn::visit::visit_item_mod(self, module);
@@ -342,6 +398,97 @@ mod tests {
         assert!(
             findings.is_empty(),
             "migrate_* helper inside a #[cfg(test)] module must not be flagged"
+        );
+    }
+
+    // Must-still-fire: `#[cfg(not(test))]` is the *production* wasm-export
+    // gate, the exact inverse of `#[cfg(test)]`. A migrate entry point inside
+    // it uses the deprecated from_binary API and never records the contract
+    // version — both real bugs, in code that ships in the wasm.
+    #[test]
+    fn test_still_flags_migrate_in_cfg_not_test_module() {
+        let source = r#"
+            use cosmwasm_std::{entry_point, from_binary, DepsMut, Env, Response, StdResult};
+            use cw2::{get_contract_version, set_contract_version};
+
+            #[cfg(not(test))]
+            mod entry {
+                use super::*;
+
+                #[entry_point]
+                pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
+                    let incoming: Config = from_binary(&msg.data)?;
+                    CONFIG.save(deps.storage, &incoming)?;
+                    Ok(Response::new().add_attribute("action", "migrate"))
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.message.contains("from_binary")),
+            "migrate inside a #[cfg(not(test))] production module must still be flagged for from_binary"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("set_contract_version")),
+            "migrate inside a #[cfg(not(test))] production module must still be flagged for the missing version stamp"
+        );
+    }
+
+    // The test-only skip must survive under composite predicates that still
+    // require `test`, while inverse/disjunctive gates stay in scope.
+    #[test]
+    fn test_still_flags_migrate_in_any_test_or_feature_module() {
+        let source = r#"
+            use cw2::set_contract_version;
+
+            // Compiled into the wasm whenever `debug-tools` is on, so this is
+            // not test-exclusive scaffolding.
+            #[cfg(any(test, feature = "debug-tools"))]
+            mod tools {
+                use super::*;
+
+                #[entry_point]
+                pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
+                    let incoming: Config = from_binary(&msg.data)?;
+                    CONFIG.save(deps.storage, &incoming)?;
+                    Ok(Response::new())
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.message.contains("from_binary")),
+            "a module gated on any(test, feature = ..) can ship in the wasm and must still be flagged"
+        );
+    }
+
+    // Composite gate that genuinely requires `test`: still scaffolding.
+    #[test]
+    fn test_no_finding_migrate_helper_in_all_test_module() {
+        let source = r#"
+            use cw2::set_contract_version;
+            #[entry_point]
+            pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+                cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+                Ok(Response::new())
+            }
+
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            mod tests {
+                use super::*;
+
+                fn migrate_with(deps: DepsMut, raw: &Binary) -> StdResult<Response> {
+                    let msg: MigrateMsg = from_binary(raw)?;
+                    migrate(deps, mock_env(), msg)
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "a module gated on all(test, ..) is test-only scaffolding and must not be flagged"
         );
     }
 

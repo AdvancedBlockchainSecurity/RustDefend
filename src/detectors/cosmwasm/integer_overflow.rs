@@ -54,7 +54,7 @@ impl Detector for IntegerOverflowDetector {
             ctx,
             in_uint_fn: false,
             uint_idents: HashSet::new(),
-            fn_body_src: String::new(),
+            proven_ge: Vec::new(),
         };
         visitor.visit_file(&ctx.ast);
         findings
@@ -68,8 +68,10 @@ struct OverflowVisitor<'a> {
     /// Identifiers (fn params + `let` bindings) known to be Uint128/Uint256 in
     /// the function currently being visited.
     uint_idents: HashSet<String>,
-    /// Token-stream source of the current function body, for guard detection.
-    fn_body_src: String,
+    /// Facts `(l, r)` meaning `l >= r` is provable at the current point, each
+    /// established by a guard that actually *dominates* it. Pushed on entry to
+    /// a guarded region, truncated back off on exit.
+    proven_ge: Vec<(String, String)>,
 }
 
 impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
@@ -125,17 +127,45 @@ impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
 
         let prev_in = self.in_uint_fn;
         let prev_idents = std::mem::take(&mut self.uint_idents);
-        let prev_body = std::mem::take(&mut self.fn_body_src);
+        let prev_facts = std::mem::take(&mut self.proven_ge);
 
         self.uint_idents = collect_uint_idents(func);
-        self.fn_body_src = fn_body_source(func);
         self.in_uint_fn = true;
 
         syn::visit::visit_item_fn(self, func);
 
         self.in_uint_fn = prev_in;
         self.uint_idents = prev_idents;
-        self.fn_body_src = prev_body;
+        self.proven_ge = prev_facts;
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        // Walk statements in source order so a guard only ever establishes facts
+        // for the statements that actually follow it, never the ones before it.
+        let saved = self.proven_ge.len();
+        for stmt in &block.stmts {
+            syn::visit::visit_stmt(self, stmt);
+            self.record_guard_facts(stmt);
+        }
+        self.proven_ge.truncate(saved);
+    }
+
+    fn visit_expr_if(&mut self, expr: &'ast syn::ExprIf) {
+        // The condition itself is ordinary code — check it under current facts.
+        self.visit_expr(&expr.cond);
+
+        // Inside the `then` branch the condition holds; inside `else` it does not.
+        let saved = self.proven_ge.len();
+        facts_from_cond(&expr.cond, &mut self.proven_ge);
+        self.visit_block(&expr.then_branch);
+        self.proven_ge.truncate(saved);
+
+        if let Some((_, else_branch)) = &expr.else_branch {
+            let saved = self.proven_ge.len();
+            negated_facts_from_cond(&expr.cond, &mut self.proven_ge);
+            self.visit_expr(else_branch);
+            self.proven_ge.truncate(saved);
+        }
     }
 
     fn visit_expr_binary(&mut self, expr: &'ast ExprBinary) {
@@ -174,9 +204,7 @@ impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
         // A dominating comparison guard over the same operands (the pervasive
         // `if balance < amount { return Err(..) }` / `ensure!(balance >= amount)`
         // idiom) makes the subtraction provably unable to underflow.
-        if matches!(expr.op, BinOp::Sub(_))
-            && sub_is_guarded(&expr.left, &expr.right, &self.fn_body_src)
-        {
+        if matches!(expr.op, BinOp::Sub(_)) && self.sub_is_guarded(&expr.left, &expr.right) {
             syn::visit::visit_expr_binary(self, expr);
             return;
         }
@@ -205,6 +233,43 @@ impl<'ast, 'a> Visit<'ast> for OverflowVisitor<'a> {
         }
 
         syn::visit::visit_expr_binary(self, expr);
+    }
+}
+
+impl<'a> OverflowVisitor<'a> {
+    /// Record the facts a *statement-position* guard establishes for everything
+    /// that follows it in the same block: either `if <cmp> { return Err(..) }`
+    /// (reachable code below implies the condition was false) or an
+    /// `ensure!/require!/assert!(<cmp>, ..)` (reachable code below implies it
+    /// held). Anything else — a `let`, a log line, an event attribute — merely
+    /// *computes* a comparison and guards nothing.
+    fn record_guard_facts(&mut self, stmt: &syn::Stmt) {
+        match stmt {
+            syn::Stmt::Expr(syn::Expr::If(ei), _) => {
+                // Only a `then` branch that unconditionally leaves makes the
+                // negated condition hold for the code after the `if`.
+                if block_diverges(&ei.then_branch) {
+                    negated_facts_from_cond(&ei.cond, &mut self.proven_ge);
+                }
+            }
+            syn::Stmt::Expr(syn::Expr::Macro(em), _) => {
+                macro_guard_facts(&em.mac, &mut self.proven_ge)
+            }
+            syn::Stmt::Macro(sm) => macro_guard_facts(&sm.mac, &mut self.proven_ge),
+            _ => {}
+        }
+    }
+
+    /// True if some guard dominating this point proves `left >= right`, so the
+    /// subtraction cannot underflow. Facts come only from real control flow —
+    /// a comparison that is merely *computed* (`let is_full = a == b;`, an
+    /// event attribute, a log line) never lands here.
+    fn sub_is_guarded(&self, left: &syn::Expr, right: &syn::Expr) -> bool {
+        let (l, r) = match (expr_ident(left), expr_ident(right)) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return false,
+        };
+        self.proven_ge.iter().any(|(gl, gr)| *gl == l && *gr == r)
     }
 }
 
@@ -368,25 +433,139 @@ fn is_const_operand(expr: &syn::Expr) -> bool {
     }
 }
 
-/// True if a `left - right` subtraction is dominated by a comparison guard over
-/// the same two operand identifiers (either order), which the standard
-/// audited CosmWasm insufficient-funds idiom relies on.
-fn sub_is_guarded(left: &syn::Expr, right: &syn::Expr, body_src: &str) -> bool {
-    let (l, r) = match (expr_ident(left), expr_ident(right)) {
-        (Some(l), Some(r)) => (l, r),
-        _ => return false,
-    };
+/// Push the `l >= r` facts that hold when `cond` is **true**.
+///
+/// Only relations that actually prove an ordering count. `a != b` proves
+/// nothing about which side is larger and so yields no facts.
+fn facts_from_cond(cond: &syn::Expr, out: &mut Vec<(String, String)>) {
+    match cond {
+        syn::Expr::Paren(e) => facts_from_cond(&e.expr, out),
+        syn::Expr::Group(e) => facts_from_cond(&e.expr, out),
+        // `!c` is true exactly when `c` is false.
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => {
+            negated_facts_from_cond(&u.expr, out)
+        }
+        syn::Expr::Binary(b) => {
+            // Both conjuncts of `a && b` hold.
+            if matches!(b.op, BinOp::And(_)) {
+                facts_from_cond(&b.left, out);
+                facts_from_cond(&b.right, out);
+                return;
+            }
+            let (l, r) = match (expr_ident(&b.left), expr_ident(&b.right)) {
+                (Some(l), Some(r)) => (l, r),
+                _ => return,
+            };
+            match b.op {
+                // l >= r and l > r both prove `l - r` cannot underflow.
+                BinOp::Ge(_) | BinOp::Gt(_) => out.push((l, r)),
+                BinOp::Le(_) | BinOp::Lt(_) => out.push((r, l)),
+                // Equality proves the ordering in both directions.
+                BinOp::Eq(_) => {
+                    out.push((l.clone(), r.clone()));
+                    out.push((r, l));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
 
-    // body_src is a token-stream string with single-space separators, so a
-    // relational expression appears verbatim as e.g. "balance < amount".
-    for op in ["<", "<=", ">", ">=", "==", "!="] {
-        if body_src.contains(&format!("{} {} {}", l, op, r))
-            || body_src.contains(&format!("{} {} {}", r, op, l))
-        {
-            return true;
+/// Push the `l >= r` facts that hold when `cond` is **false** — i.e. the facts
+/// available to code that is only reachable because the guard did not fire.
+fn negated_facts_from_cond(cond: &syn::Expr, out: &mut Vec<(String, String)>) {
+    match cond {
+        syn::Expr::Paren(e) => negated_facts_from_cond(&e.expr, out),
+        syn::Expr::Group(e) => negated_facts_from_cond(&e.expr, out),
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => facts_from_cond(&u.expr, out),
+        syn::Expr::Binary(b) => {
+            // `a || b` is false only when both disjuncts are false.
+            if matches!(b.op, BinOp::Or(_)) {
+                negated_facts_from_cond(&b.left, out);
+                negated_facts_from_cond(&b.right, out);
+                return;
+            }
+            let (l, r) = match (expr_ident(&b.left), expr_ident(&b.right)) {
+                (Some(l), Some(r)) => (l, r),
+                _ => return,
+            };
+            match b.op {
+                // !(l < r) => l >= r; !(l <= r) => l > r.
+                BinOp::Lt(_) | BinOp::Le(_) => out.push((l, r)),
+                BinOp::Gt(_) | BinOp::Ge(_) => out.push((r, l)),
+                // !(l != r) => l == r.
+                BinOp::Ne(_) => {
+                    out.push((l.clone(), r.clone()));
+                    out.push((r, l));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does this block unconditionally leave the enclosing function or loop? Only
+/// then does an `if` act as a guard over the code that follows it.
+fn block_diverges(block: &syn::Block) -> bool {
+    block.stmts.iter().any(|stmt| match stmt {
+        syn::Stmt::Expr(e, _) => expr_diverges(e),
+        syn::Stmt::Macro(m) => macro_diverges(&m.mac),
+        _ => false,
+    })
+}
+
+fn expr_diverges(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_) => true,
+        syn::Expr::Macro(m) => macro_diverges(&m.mac),
+        syn::Expr::Paren(e) => expr_diverges(&e.expr),
+        syn::Expr::Group(e) => expr_diverges(&e.expr),
+        _ => false,
+    }
+}
+
+/// `panic!`/`bail!`-style macros that never return.
+fn macro_diverges(mac: &syn::Macro) -> bool {
+    mac.path
+        .segments
+        .last()
+        .map(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "panic" | "unreachable" | "todo" | "unimplemented" | "bail"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Facts established by an `ensure!(cond, ..)` / `require!(cond, ..)` /
+/// `assert!(cond)` statement: reachable code below it implies `cond` held.
+fn macro_guard_facts(mac: &syn::Macro, out: &mut Vec<(String, String)>) {
+    let asserts_cond = mac
+        .path
+        .segments
+        .last()
+        .map(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "ensure" | "require" | "assert" | "debug_assert"
+            )
+        })
+        .unwrap_or(false);
+    if !asserts_cond {
+        return;
+    }
+
+    // The condition is the first comma-separated argument; the rest is the
+    // error value / format args and is irrelevant here.
+    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+    if let Ok(args) = mac.parse_body_with(parser) {
+        if let Some(cond) = args.first() {
+            facts_from_cond(cond, out);
         }
     }
-    false
 }
 
 /// The single identifier of a simple path expression, if any.
@@ -508,6 +687,121 @@ mod tests {
         assert!(
             findings.is_empty(),
             "ensure!-guarded subtraction must not be flagged: {:?}",
+            findings
+        );
+    }
+
+    // The positive form of the idiom: the subtraction sits in the branch where
+    // the comparison is known to hold.
+    #[test]
+    fn test_no_finding_subtraction_in_guarded_branch() {
+        let source = r#"
+            fn withdraw(balance: Uint128, amount: Uint128) -> Result<Uint128, ContractError> {
+                if balance >= amount {
+                    Ok(balance - amount)
+                } else {
+                    Err(ContractError::InsufficientFunds {})
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Subtraction inside the branch where the guard holds must not be flagged: {:?}",
+            findings
+        );
+    }
+
+    // --- REGRESSION (ADV-206 false negative) ---
+    // The guard used to be a substring scan of the whole function body, so any
+    // textual occurrence of the two operands around a relational operator
+    // silenced the subtraction. Here `balance == amount` only computes an event
+    // attribute — it gates nothing, execution continues either way, and
+    // `balance - amount` underflows for `amount > balance`. MUST fire.
+    #[test]
+    fn test_still_flags_subtraction_with_non_guarding_comparison() {
+        let source = r#"
+            pub fn execute_withdraw(deps: DepsMut, info: MessageInfo, amount: Uint128) -> Result<Response, ContractError> {
+                let balance: Uint128 = BALANCES
+                    .load(deps.storage, info.sender.as_str())
+                    .unwrap_or_default();
+
+                // Indexer hint only. Not a guard: no early return, no ensure!.
+                let is_full_withdrawal = balance == amount;
+
+                let remaining = balance - amount;
+
+                BALANCES.save(deps.storage, info.sender.as_str(), &remaining).ok();
+
+                Ok(Response::new()
+                    .add_attribute("action", "withdraw")
+                    .add_attribute("full_withdrawal", is_full_withdrawal.to_string()))
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A comparison that only computes a value must not suppress the underflow: {:?}",
+            findings
+        );
+    }
+
+    // A comparison inside an `if` whose body does NOT leave the function guards
+    // nothing — execution falls through to the subtraction regardless.
+    #[test]
+    fn test_still_flags_subtraction_after_non_diverging_if() {
+        let source = r#"
+            fn withdraw(balance: Uint128, amount: Uint128) -> Uint128 {
+                if balance < amount {
+                    deps.api.debug("overdrawn");
+                }
+                balance - amount
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "An if-guard that does not return/panic must not suppress the underflow: {:?}",
+            findings
+        );
+    }
+
+    // The guard must be direction-aware: this one is inverted, so it rejects
+    // exactly the safe calls and lets the underflowing ones through.
+    #[test]
+    fn test_still_flags_inverted_guard() {
+        let source = r#"
+            fn withdraw(balance: Uint128, amount: Uint128) -> Result<Uint128, ContractError> {
+                if balance > amount {
+                    return Err(ContractError::InsufficientFunds {});
+                }
+                Ok(balance - amount)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "An inverted guard proves nothing and must not suppress: {:?}",
+            findings
+        );
+    }
+
+    // Guard must dominate: comparing *after* the subtraction is too late.
+    #[test]
+    fn test_still_flags_subtraction_before_guard() {
+        let source = r#"
+            fn withdraw(balance: Uint128, amount: Uint128) -> Result<Uint128, ContractError> {
+                let remaining = balance - amount;
+                if balance < amount {
+                    return Err(ContractError::InsufficientFunds {});
+                }
+                Ok(remaining)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A guard placed after the subtraction cannot make it safe: {:?}",
             findings
         );
     }

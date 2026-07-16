@@ -1,6 +1,8 @@
 use quote::ToTokens;
+use std::collections::HashMap;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{Attribute, Block, FnArg, ImplItemFn, ItemMod, Pat, Signature};
+use syn::{Attribute, Block, Expr, FnArg, ImplItemFn, ItemMod, Local, Pat, Signature, Token};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -168,22 +170,179 @@ fn arg_is_trusted(arg_tokens: &str) -> bool {
     false
 }
 
-/// Does the body validate the code hash it delegates to? Recognises
-/// equality/inequality comparisons and membership checks against the hash
-/// parameter, known allow-list vocabulary, and caller/admin access gating
-/// (which means the hash is not attacker-controlled).
-fn body_has_hash_verification(body: &str, hash_params: &[String]) -> bool {
-    // Legacy / explicit allow-list vocabulary.
-    if body.contains("assert_eq !")
-        || body.contains("assert_eq!")
-        || body.contains("KNOWN_HASH")
-        || body.contains("ALLOWED_HASH")
-        || body.contains("whitelist")
-        || body.contains("allowed_hashes")
+/// Collect every `let` binding in a body as `name -> initializer tokens`, so a
+/// comparison against a local can be resolved back to what the local actually
+/// holds (`let zero = Hash::from([0u8; 32]);` is a sentinel, not an allow-list).
+struct LetCollector {
+    bindings: HashMap<String, String>,
+}
+
+impl<'ast> Visit<'ast> for LetCollector {
+    fn visit_local(&mut self, l: &'ast Local) {
+        let pat = match &l.pat {
+            Pat::Type(pt) => pt.pat.as_ref(),
+            other => other,
+        };
+        if let Pat::Ident(pi) = pat {
+            if let Some(init) = &l.init {
+                self.bindings.insert(
+                    pi.ident.to_string(),
+                    init.expr.to_token_stream().to_string(),
+                );
+            }
+        }
+        syn::visit::visit_local(self, l);
+    }
+}
+
+/// Peel references / derefs / parens off an expression and render what is left.
+fn core_tokens(e: &Expr) -> String {
+    match e {
+        Expr::Reference(r) => core_tokens(&r.expr),
+        Expr::Paren(p) => core_tokens(&p.expr),
+        Expr::Group(g) => core_tokens(&g.expr),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => core_tokens(&u.expr),
+        _ => e.to_token_stream().to_string(),
+    }
+}
+
+/// Is this expression the hash parameter itself (possibly `.clone()`d)?
+fn expr_is_hash_param(e: &Expr, hash_params: &[String]) -> bool {
+    let t = core_tokens(e);
+    let t = t.trim();
+    hash_params
+        .iter()
+        .any(|p| t == p.as_str() || t.starts_with(&format!("{} .", p)))
+}
+
+/// Is this expression an *authoritative* source to check a code hash against —
+/// contract storage (`self.approved_code_hash`), an associated item
+/// (`Self::ALLOWED`), or a named constant (`KNOWN_HASH`)?
+///
+/// A locally constructed value is deliberately NOT authoritative: comparing a
+/// code hash against `Hash::from([0u8; 32])` rejects exactly one hash out of
+/// 2^256 and leaves every attacker-chosen hash accepted. That is a null check,
+/// not a verification. Locals are resolved through their `let` initializer so
+/// `let expected = KNOWN_HASH; ... == expected` still counts.
+fn is_authoritative_source(tokens: &str, lets: &HashMap<String, String>, depth: usize) -> bool {
+    let mut t = tokens.trim();
+    while let Some(rest) = t.strip_prefix('&') {
+        t = rest.trim();
+    }
+    if t.is_empty() {
+        return false;
+    }
+    // Storage field / getter / associated item.
+    if t.starts_with("self .") || t.starts_with("self.") || t.starts_with("Self ::") {
+        return true;
+    }
+    // SCREAMING_SNAKE_CASE constant, optionally path-qualified. Requires at
+    // least one letter so a bare `0` literal is not mistaken for a constant.
+    let last = t.rsplit("::").next().unwrap_or(t).trim();
+    if !last.is_empty()
+        && last
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        && last.chars().any(|c| c.is_ascii_uppercase())
     {
         return true;
     }
+    // A local binding: resolve once through its initializer.
+    if depth > 0 {
+        if let Some(init) = lets.get(t) {
+            return is_authoritative_source(init, lets, depth - 1);
+        }
+    }
+    false
+}
+
+/// Structural evidence that the body checks a hash parameter against an
+/// authoritative source: an `==`/`!=` comparison, an `assert_eq!`/`assert_ne!`
+/// over the pair, or a membership lookup (`contains`/`get`) on an allow-list
+/// held in storage.
+struct HashCheckFinder<'a> {
+    hash_params: &'a [String],
+    lets: &'a HashMap<String, String>,
+    found: bool,
+}
+
+impl<'a> HashCheckFinder<'a> {
+    /// One operand is the hash parameter, the other an authoritative source.
+    fn is_checked_pair(&self, a: &Expr, b: &Expr) -> bool {
+        let (at, bt) = (core_tokens(a), core_tokens(b));
+        (expr_is_hash_param(a, self.hash_params) && is_authoritative_source(&bt, self.lets, 1))
+            || (expr_is_hash_param(b, self.hash_params)
+                && is_authoritative_source(&at, self.lets, 1))
+    }
+
+    fn check_macro(&mut self, mac: &syn::Macro) {
+        let name = match mac.path.segments.last() {
+            Some(s) => s.ident.to_string(),
+            None => return,
+        };
+        if !matches!(
+            name.as_str(),
+            "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne"
+        ) {
+            return;
+        }
+        if let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
+            let args: Vec<Expr> = args.into_iter().collect();
+            if args.len() >= 2 && self.is_checked_pair(&args[0], &args[1]) {
+                self.found = true;
+            }
+        }
+    }
+}
+
+impl<'ast, 'a> Visit<'ast> for HashCheckFinder<'a> {
+    fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+        if matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+            && self.is_checked_pair(&b.left, &b.right)
+        {
+            self.found = true;
+        }
+        syn::visit::visit_expr_binary(self, b);
+    }
+
+    fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+        let m = c.method.to_string();
+        if matches!(
+            m.as_str(),
+            "contains" | "contains_key" | "get" | "get_mut" | "contains_hash"
+        ) && c
+            .args
+            .iter()
+            .any(|a| expr_is_hash_param(a, self.hash_params))
+            && is_authoritative_source(&core_tokens(&c.receiver), self.lets, 1)
+        {
+            self.found = true;
+        }
+        syn::visit::visit_expr_method_call(self, c);
+    }
+
+    fn visit_expr_macro(&mut self, m: &'ast syn::ExprMacro) {
+        self.check_macro(&m.mac);
+        syn::visit::visit_expr_macro(self, m);
+    }
+
+    fn visit_stmt_macro(&mut self, m: &'ast syn::StmtMacro) {
+        self.check_macro(&m.mac);
+        syn::visit::visit_stmt_macro(self, m);
+    }
+}
+
+/// Does the body validate the code hash it delegates to? Recognises structural
+/// checks of a hash parameter against an authoritative source, known allow-list
+/// vocabulary, and caller/admin access gating (which means the hash is not
+/// attacker-controlled).
+fn body_has_hash_verification(block: &Block, body: &str, hash_params: &[String]) -> bool {
+    // Explicit allow-list vocabulary.
     for kw in [
+        "KNOWN_HASH",
+        "ALLOWED_HASH",
+        "whitelist",
+        "allowed_hashes",
         "is_approved",
         "is_allowed",
         "is_whitelisted",
@@ -216,19 +375,26 @@ fn body_has_hash_verification(body: &str, hash_params: &[String]) -> bool {
         return true;
     }
 
-    // Per-parameter equality / membership guards.
-    for p in hash_params {
-        if body.contains(&format!("{} ==", p))
-            || body.contains(&format!("{} !=", p))
-            || body.contains(&format!("== {}", p))
-            || body.contains(&format!("!= {}", p))
-            || body.contains(&format!(". contains (& {}", p))
-            || body.contains(&format!("contains (& {})", p))
-        {
-            return true;
-        }
+    // Per-parameter equality / membership guards. Structural, not textual: the
+    // hash must actually be an operand of a comparison / assertion / allow-list
+    // lookup whose OTHER side is an authoritative source. A textual `code_hash
+    // ==` also matched `if code_hash == zero { return Err(..) }`, a null-sentinel
+    // check that rejects one hash out of 2^256 and silenced the detector on a
+    // fully attacker-controlled delegate target.
+    if hash_params.is_empty() {
+        return false;
     }
-    false
+    let mut lc = LetCollector {
+        bindings: HashMap::new(),
+    };
+    lc.visit_block(block);
+    let mut finder = HashCheckFinder {
+        hash_params,
+        lets: &lc.bindings,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
 }
 
 /// Core decision: given a method, should it be reported as an unsafe
@@ -258,7 +424,7 @@ fn method_is_unsafe_delegate(method: &ImplItemFn, summaries: &[MethodSummary]) -
     }
 
     // The method itself validates the hash before delegating.
-    if body_has_hash_verification(&body_src, &hash_params) {
+    if body_has_hash_verification(&method.block, &body_src, &hash_params) {
         return false;
     }
 
@@ -299,7 +465,8 @@ fn build_method_summaries(ast: &syn::File) -> Vec<MethodSummary> {
             }
             let body_src = method.block.to_token_stream().to_string();
             let hash_params = collect_hash_params(&method.sig);
-            let has_verification = body_has_hash_verification(&body_src, &hash_params);
+            let has_verification =
+                body_has_hash_verification(&method.block, &body_src, &hash_params);
 
             let mut mc = MethodCallCollector { calls: Vec::new() };
             mc.visit_block(&method.block);
@@ -563,6 +730,94 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "Helper reached by an unvalidated caller must still be flagged"
+        );
+    }
+
+    // MUST STILL FLAG: a non-zero sanity check on the code hash is NOT a
+    // verification. `code_hash == zero` rejects exactly one hash out of 2^256;
+    // the attacker still passes their own uploaded code hash and gets arbitrary
+    // code executed against this contract's storage. ADV-206's textual
+    // `format!("{} ==", p)` guard silenced this genuinely vulnerable proxy.
+    #[test]
+    fn test_still_flags_zero_sentinel_hash_check() {
+        let source = r#"
+            impl UpgradeableProxy {
+                #[ink(message)]
+                pub fn execute(&mut self, code_hash: Hash, selector: [u8; 4]) -> Result<(), Error> {
+                    let zero = Hash::from([0u8; 32]);
+                    if code_hash == zero {
+                        return Err(Error::ZeroCodeHash);
+                    }
+
+                    self.calls = self.calls.saturating_add(1);
+
+                    build_call::<ink::env::DefaultEnvironment>()
+                        .delegate(code_hash)
+                        .exec_input(ExecutionInput::new(Selector::new(selector)))
+                        .returns::<()>()
+                        .try_invoke()
+                        .map_err(|_| Error::DelegateFailed)?
+                        .map_err(|_| Error::DelegateFailed)?;
+
+                    Ok(())
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A zero-sentinel check is not hash verification: the delegate target is \
+             still fully attacker-controlled"
+        );
+    }
+
+    // MUST STILL FLAG: same class as above via `Hash::default()`, and comparing
+    // against a freshly decoded caller-supplied value is likewise no allow-list.
+    #[test]
+    fn test_still_flags_default_sentinel_hash_check() {
+        let source = r#"
+            impl Proxy {
+                #[ink(message)]
+                pub fn run(&mut self, code_hash: Hash) -> Result<(), Error> {
+                    if code_hash != Hash::default() {
+                        ink::env::call::build_call::<Environment>()
+                            .delegate(code_hash)
+                            .invoke();
+                    }
+                    Ok(())
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Comparing against Hash::default() is a null check, not verification"
+        );
+    }
+
+    // The structural check must still accept a real allow-list comparison
+    // against contract storage even when it is bound to a local first.
+    #[test]
+    fn test_no_finding_hash_compared_to_local_bound_storage() {
+        let source = r#"
+            impl Proxy {
+                #[ink(message)]
+                pub fn run(&mut self, code_hash: Hash) -> Result<(), Error> {
+                    let expected = self.logic_hash;
+                    if code_hash != expected {
+                        return Err(Error::BadHash);
+                    }
+                    ink::env::call::build_call::<Environment>()
+                        .delegate(code_hash)
+                        .invoke();
+                    Ok(())
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Comparison against storage via a local binding is real verification"
         );
     }
 

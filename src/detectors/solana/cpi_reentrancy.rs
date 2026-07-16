@@ -1,6 +1,6 @@
 use quote::ToTokens;
 use syn::visit::Visit;
-use syn::{ItemFn, ItemMod, Local, Pat, Stmt};
+use syn::{Expr, ItemFn, ItemMod, Local, Pat, Stmt};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -79,8 +79,14 @@ impl<'ast, 'a> Visit<'ast> for ReentrancyVisitor<'a> {
 
             // (1) `let cpi_ctx = CpiContext::new(..)` merely builds an in-memory
             // struct. Record the binding but do NOT treat it as the CPI.
+            //
+            // This must be decided *structurally*, on the shape of the init
+            // expression, not on the statement merely mentioning `CpiContext`:
+            // `let payout = amm::cpi::swap(CpiContext::new(..), amount)?;`
+            // also mentions it, but there the context is an argument that the
+            // call consumes — the CPI happens on that very line.
             if let Stmt::Local(local) = stmt {
-                if clean.contains("CpiContext") && clean.contains("new") {
+                if local_init_is_cpi_context_ctor(local) {
                     if let Some(id) = local_binding_ident(local) {
                         pending_ctx_vars.push(id);
                     }
@@ -205,6 +211,64 @@ fn collect_string_literals(ts: proc_macro2::TokenStream, out: &mut Vec<String>) 
             _ => {}
         }
     }
+}
+
+/// True if a `let` binds the *result of constructing* a `CpiContext` and
+/// nothing more — `let cpi_ctx = CpiContext::new(a, b);`,
+/// `CpiContext::new_with_signer(a, b, seeds)`, or a builder chain on top of one
+/// (`CpiContext::new(a, b).with_signer(seeds)`). Such a statement allocates an
+/// in-memory struct; no cross-program invocation happens until some *other*
+/// call consumes the context.
+///
+/// Deliberately structural: the CpiContext must be the *root of the init
+/// expression*, not merely a token somewhere inside it. When the context is
+/// built inline in another call's argument list
+/// (`let payout = amm::cpi::swap(CpiContext::new(..), amount)?;`) the root is
+/// `amm::cpi::swap` — that call performs the CPI, so this returns false and the
+/// statement falls through to CPI recognition.
+fn local_init_is_cpi_context_ctor(local: &Local) -> bool {
+    local
+        .init
+        .as_ref()
+        .is_some_and(|init| expr_is_cpi_context_ctor(&init.expr))
+}
+
+fn expr_is_cpi_context_ctor(expr: &Expr) -> bool {
+    match expr {
+        // `CpiContext::new(..)` / `CpiContext::new_with_signer(..)`: the callee
+        // path itself is the constructor.
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(p) => path_is_cpi_context_ctor(&p.path),
+            _ => false,
+        },
+        // Builder chain over a constructor. Only the known context-shaping
+        // builders are transparent; any other method call is treated as a
+        // potential consumer of the context and is *not* skipped.
+        Expr::MethodCall(mc) => {
+            let m = mc.method.to_string();
+            (m == "with_signer" || m == "with_remaining_accounts")
+                && expr_is_cpi_context_ctor(&mc.receiver)
+        }
+        // Transparent wrappers around the construction.
+        Expr::Try(t) => expr_is_cpi_context_ctor(&t.expr),
+        Expr::Paren(p) => expr_is_cpi_context_ctor(&p.expr),
+        Expr::Group(g) => expr_is_cpi_context_ctor(&g.expr),
+        Expr::Reference(r) => expr_is_cpi_context_ctor(&r.expr),
+        _ => false,
+    }
+}
+
+/// True for a path whose last two segments are `CpiContext::new*` — covers
+/// `CpiContext::new`, `CpiContext::new_with_signer`, and fully-qualified forms
+/// such as `anchor_lang::context::CpiContext::new`.
+fn path_is_cpi_context_ctor(path: &syn::Path) -> bool {
+    let segs: Vec<String> = path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>();
+    let n = segs.len();
+    n >= 2 && segs[n - 2] == "CpiContext" && segs[n - 1].starts_with("new")
 }
 
 /// Extract the identifier bound by a `let` pattern (`let x = ..`, `let mut x`,
@@ -368,6 +432,80 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "Should detect mutation after the CpiContext is consumed by transfer"
+        );
+    }
+
+    // --- MUST STILL FLAG: the CpiContext is built inline in the CPI call's
+    // argument list and the whole call is bound with `let`. The statement
+    // mentions `CpiContext` and `new`, but the call consuming it *is* the CPI,
+    // so the writes that follow are effects-after-interaction. ---
+    #[test]
+    fn test_still_flags_inline_cpi_context_in_call_args() {
+        let source = r#"
+            pub fn redeem(ctx: Context<Redeem>, amount: u64) -> Result<()> {
+                let vault_info = ctx.accounts.vault.to_account_info();
+                let payout = amm::cpi::swap(
+                    CpiContext::new(
+                        ctx.accounts.amm_program.to_account_info(),
+                        amm::cpi::accounts::Swap {
+                            pool: ctx.accounts.pool.to_account_info(),
+                            user: ctx.accounts.user.to_account_info(),
+                        },
+                    ),
+                    amount,
+                )?;
+                let mut data = vault_info.try_borrow_mut_data()?;
+                data[0] = 0;
+                data[8] = payout as u8;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "An inline `CpiContext::new(..)` in the CPI call's args must not hide \
+             the CPI: mutations after it are CEI violations"
+        );
+    }
+
+    // --- MUST STILL FLAG: same evasion via `invoke_signed` bound with `let`. ---
+    #[test]
+    fn test_still_flags_mutation_after_let_bound_native_cpi() {
+        let source = r#"
+            fn process(accounts: &[AccountInfo]) -> ProgramResult {
+                let result = invoke_signed(&ix, accounts, &[&seeds])?;
+                let mut data = vault.try_borrow_mut_data()?;
+                data[0] = 1;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Binding a native CPI's result with `let` must not hide the CPI"
+        );
+    }
+
+    // --- FP guard: a builder chain over the constructor is still construction
+    // only; the CPI happens when `transfer` consumes the context. ---
+    #[test]
+    fn test_no_finding_ctx_builder_chain_before_real_cpi() {
+        let source = r#"
+            fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+                let cpi_ctx = CpiContext::new(token_program, transfer_accounts)
+                    .with_signer(&[&seeds[..]]);
+                let mut data = vault_info.try_borrow_mut_data()?;
+                data[0] = 0;
+                drop(data);
+                token::transfer(cpi_ctx, amount)?;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "`CpiContext::new(..).with_signer(..)` only builds a context; \
+             mutations before it is consumed follow CEI"
         );
     }
 
