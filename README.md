@@ -1,7 +1,7 @@
 # RustDefend
 
 [![Crates.io](https://img.shields.io/crates/v/rustdefend)](https://crates.io/crates/rustdefend)
-[![CI](https://github.com/BlockSecOps/RustDefend/actions/workflows/ci.yml/badge.svg)](https://github.com/BlockSecOps/RustDefend/actions)
+[![CI](https://github.com/AdvancedBlockchainSecurity/RustDefend/actions/workflows/ci.yml/badge.svg)](https://github.com/AdvancedBlockchainSecurity/RustDefend/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Static security scanner for Rust smart contracts. Analyzes source code via AST parsing (`syn` crate) to detect vulnerabilities across Solana, CosmWasm, NEAR, and ink! ecosystems.
@@ -31,14 +31,14 @@ cargo install rustdefend
 Requires Rust 1.70+.
 
 ```bash
-git clone https://github.com/BlockSecOps/RustDefend.git
+git clone https://github.com/AdvancedBlockchainSecurity/RustDefend.git
 cd RustDefend
 cargo install --path .
 ```
 
 ### Pre-built binaries
 
-Download from [GitHub Releases](https://github.com/BlockSecOps/RustDefend/releases). Available for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64).
+Download from [GitHub Releases](https://github.com/AdvancedBlockchainSecurity/RustDefend/releases). Available for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64).
 
 ## Usage
 
