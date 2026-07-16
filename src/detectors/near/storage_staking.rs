@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
-    Attribute, Block, Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, ItemFn, ItemMod, Signature,
+    Attribute, Block, Expr, ExprCall, ExprIf, ExprMethodCall, ExprPath, ExprReturn, FnArg, ItemFn,
+    ItemMod, Local, Macro, Pat, ReturnType, Signature, Stmt, Token,
 };
 
 use crate::detectors::Detector;
@@ -34,15 +37,17 @@ impl Detector for StorageStakingDetector {
     }
 
     fn detect(&self, ctx: &ScanContext) -> Vec<Finding> {
-        // Build a within-file map of every (non-test) function/method body and the
-        // set of callees each invokes. This lets us soundly resolve whether the
-        // caller identity is authorized one frame up (a trusted caller that reads
+        // Build a within-file summary of every (non-test) function/method: what it
+        // actually *does* with the caller identity, and which callees it hands a
+        // resolved identity to. This lets us soundly resolve whether the caller
+        // identity is authorized one frame up (a trusted caller that reads
         // `predecessor_account_id` and passes the account down) or one frame down
-        // (auth factored into a shared helper), instead of relying on a single
-        // literal match on the flagged function's own body.
+        // (auth factored into a shared helper), instead of relying on a literal
+        // match on a body — a body that merely *mentions* the token (logging the
+        // caller into an event) authorizes nothing.
         let mut collector = FnDefCollector {
-            bodies: HashMap::new(),
-            calls: HashMap::new(),
+            roles: HashMap::new(),
+            identity_args: HashMap::new(),
         };
         collector.visit_file(&ctx.ast);
 
@@ -50,8 +55,8 @@ impl Detector for StorageStakingDetector {
         let mut visitor = StorageVisitor {
             findings: &mut findings,
             ctx,
-            bodies: &collector.bodies,
-            calls: &collector.calls,
+            roles: &collector.roles,
+            identity_args: &collector.identity_args,
         };
         visitor.visit_file(&ctx.ast);
         findings
@@ -122,18 +127,393 @@ fn has_required_account_id_param(sig: &Signature) -> bool {
     })
 }
 
-/// Visitor that records, for each non-test function/method in the file, its body
-/// source and the callees it invokes.
+/// The leading arguments of an assertion macro that form the *decision*. Every
+/// argument after them is the panic message, where a mention of the caller
+/// proves nothing: `assert!(x, "rejected {}", env::predecessor_account_id())`
+/// checks nothing whatsoever about the caller.
+fn assert_condition_arity(name: &str) -> Option<usize> {
+    match name {
+        "assert" | "debug_assert" | "require" => Some(1),
+        "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne" | "require_eq" => Some(2),
+        _ => None,
+    }
+}
+
+/// The trailing segment of a macro's path (`near_sdk::require!` -> `require`).
+fn macro_name(mac: &Macro) -> String {
+    mac.path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
+}
+
+/// True if any identifier inside an opaque macro token tree satisfies `pred`.
+fn tokens_mention(tokens: TokenStream, pred: &dyn Fn(&str) -> bool) -> bool {
+    tokens.into_iter().any(|tt| match tt {
+        TokenTree::Ident(id) => pred(&id.to_string()),
+        TokenTree::Group(g) => tokens_mention(g.stream(), pred),
+        _ => false,
+    })
+}
+
+/// True if `ident` names the caller identity: the `predecessor_account_id` read
+/// itself, or a local bound from one.
+fn is_identity_ident(taint: &HashSet<String>, ident: &str) -> bool {
+    ident == "predecessor_account_id" || taint.contains(ident)
+}
+
+/// Finds *reads* of the caller identity inside an expression tree.
+struct PredecessorReadVisitor<'t> {
+    taint: &'t HashSet<String>,
+    found: bool,
+}
+
+impl<'ast, 't> Visit<'ast> for PredecessorReadVisitor<'t> {
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        if let Some(segment) = node.path.segments.last() {
+            if is_identity_ident(self.taint, &segment.ident.to_string()) {
+                self.found = true;
+            }
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        if is_identity_ident(self.taint, &node.method.to_string()) {
+            self.found = true;
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        // Macro bodies are opaque token trees; fall back to an ident scan.
+        let taint = self.taint;
+        if tokens_mention(node.tokens.clone(), &|id| is_identity_ident(taint, id)) {
+            self.found = true;
+        }
+    }
+}
+
+/// True if the expression reads the caller identity, directly or through a local
+/// bound from one.
+fn expr_reads_predecessor(expr: &Expr, taint: &HashSet<String>) -> bool {
+    let mut visitor = PredecessorReadVisitor {
+        taint,
+        found: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.found
+}
+
+/// Collect the idents a `let` pattern binds (`let caller`, `let (a, b)`, ...).
+fn collect_pat_idents(pat: &Pat, out: &mut HashSet<String>) {
+    match pat {
+        Pat::Ident(pi) => {
+            out.insert(pi.ident.to_string());
+        }
+        Pat::Tuple(t) => t.elems.iter().for_each(|p| collect_pat_idents(p, out)),
+        Pat::Type(pt) => collect_pat_idents(&pt.pat, out),
+        Pat::Reference(pr) => collect_pat_idents(&pr.pat, out),
+        _ => {}
+    }
+}
+
+/// Records locals bound from a caller-identity read: after
+/// `let caller = env::predecessor_account_id();`, `caller` *is* the caller.
+struct TaintCollector {
+    names: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for TaintCollector {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Some(init) = &node.init {
+            if expr_reads_predecessor(&init.expr, &self.names) {
+                collect_pat_idents(&node.pat, &mut self.names);
+            }
+        }
+        syn::visit::visit_local(self, node);
+    }
+}
+
+/// The locals in `block` that carry the caller identity, to a fixpoint so that
+/// chained bindings (`let caller = env::predecessor_account_id(); let who =
+/// caller;`) propagate.
+fn predecessor_taint(block: &Block) -> HashSet<String> {
+    let mut names = HashSet::new();
+    loop {
+        let mut collector = TaintCollector {
+            names: names.clone(),
+        };
+        collector.visit_block(block);
+        if collector.names.len() == names.len() {
+            return names;
+        }
+        names = collector.names;
+    }
+}
+
+/// Finds early rejection — a panic or an early return — inside a block.
+struct RejectVisitor {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for RejectVisitor {
+    fn visit_expr_return(&mut self, node: &'ast ExprReturn) {
+        self.found = true;
+        syn::visit::visit_expr_return(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        if matches!(
+            macro_name(node).as_str(),
+            "panic" | "unreachable" | "assert" | "assert_eq" | "assert_ne" | "require"
+        ) {
+            self.found = true;
+        }
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if let Expr::Path(ExprPath { path, .. }) = node.func.as_ref() {
+            if let Some(segment) = path.segments.last() {
+                if matches!(
+                    segment.ident.to_string().as_str(),
+                    "panic_str" | "panic_utf8" | "abort"
+                ) {
+                    self.found = true;
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+}
+
+/// True if the block rejects the call outright (panics or returns early). This
+/// is what separates an authorization guard (`if caller != owner { panic!() }`)
+/// from a branch that merely happens to read the caller.
+fn block_rejects(block: &Block) -> bool {
+    let mut visitor = RejectVisitor { found: false };
+    visitor.visit_block(block);
+    visitor.found
+}
+
+/// Finds the structural sites where the caller identity actually drives a
+/// decision. Merely *mentioning* `predecessor_account_id` — logging it into an
+/// event, formatting it into a panic message — authorizes nothing.
+struct EnforcementVisitor<'t> {
+    taint: &'t HashSet<String>,
+    enforced: bool,
+}
+
+impl<'ast, 't> Visit<'ast> for EnforcementVisitor<'t> {
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        // `assert!(caller == owner)` / `require!(self.is_member(&caller))`: only
+        // the leading condition operands count, never the message arguments.
+        if let Some(arity) = assert_condition_arity(&macro_name(node)) {
+            if let Ok(args) = node.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+            {
+                if args
+                    .iter()
+                    .take(arity)
+                    .any(|arg| expr_reads_predecessor(arg, self.taint))
+                {
+                    self.enforced = true;
+                }
+            }
+        }
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        // `if caller != self.owner { env::panic_str("unauthorized") }`: branches
+        // on the caller AND rejects.
+        if expr_reads_predecessor(&node.cond, self.taint) && block_rejects(&node.then_branch) {
+            self.enforced = true;
+        }
+        syn::visit::visit_expr_if(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        // `self.accounts.get(&caller).expect("not registered")`: the lookup is
+        // keyed by the caller and aborts when the caller is absent.
+        if matches!(node.method.to_string().as_str(), "expect" | "unwrap")
+            && expr_reads_predecessor(&node.receiver, self.taint)
+        {
+            self.enforced = true;
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Finds `return <caller identity>` in a helper body.
+struct ReturnExprVisitor<'t> {
+    taint: &'t HashSet<String>,
+    found: bool,
+}
+
+impl<'ast, 't> Visit<'ast> for ReturnExprVisitor<'t> {
+    fn visit_expr_return(&mut self, node: &'ast ExprReturn) {
+        if let Some(expr) = &node.expr {
+            if expr_reads_predecessor(expr, self.taint) {
+                self.found = true;
+            }
+        }
+        syn::visit::visit_expr_return(self, node);
+    }
+}
+
+/// True if the helper hands the *resolved* caller identity back to its caller
+/// (`fn caller(&self) -> AccountId { env::predecessor_account_id() }`). What it
+/// returns is authoritative, exactly like an inline read. Restricted to
+/// `AccountId`-shaped returns: a helper returning some other value merely
+/// derived from the caller is not an identity resolution.
+fn returns_caller_identity(sig: &Signature, block: &Block, taint: &HashSet<String>) -> bool {
+    let ty = match &sig.output {
+        ReturnType::Type(_, ty) => ty,
+        ReturnType::Default => return false,
+    };
+    if !ty.to_token_stream().to_string().contains("AccountId") {
+        return false;
+    }
+    if matches!(block.stmts.last(), Some(Stmt::Expr(expr, None)) if expr_reads_predecessor(expr, taint))
+    {
+        return true;
+    }
+    let mut visitor = ReturnExprVisitor {
+        taint,
+        found: false,
+    };
+    visitor.visit_block(block);
+    visitor.found
+}
+
+/// What a same-file function actually does with the caller identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallerIdentityRole {
+    /// The body drives a *decision* off `predecessor_account_id`: an
+    /// `assert!`/`require!` condition, a rejecting `if` guard, or an `expect` on
+    /// a caller-keyed lookup.
+    Enforces,
+    /// The body returns the resolved caller identity to whoever called it.
+    Resolves,
+}
+
+/// Classify a function by what it does with `predecessor_account_id`, purely
+/// structurally. A body that only mentions the token gets no role at all.
+fn classify_caller_identity(sig: &Signature, block: &Block) -> Option<CallerIdentityRole> {
+    let taint = predecessor_taint(block);
+    let mut visitor = EnforcementVisitor {
+        taint: &taint,
+        enforced: false,
+    };
+    visitor.visit_block(block);
+    if visitor.enforced {
+        return Some(CallerIdentityRole::Enforces);
+    }
+    if returns_caller_identity(sig, block, &taint) {
+        return Some(CallerIdentityRole::Resolves);
+    }
+    None
+}
+
+/// The name of the function/method a call expression targets, if it *is* a call.
+fn call_target_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Call(ExprCall { func, .. }) => match func.as_ref() {
+            Expr::Path(ExprPath { path, .. }) => path.segments.last().map(|s| s.ident.to_string()),
+            _ => None,
+        },
+        Expr::MethodCall(m) => Some(m.method.to_string()),
+        _ => None,
+    }
+}
+
+/// Collects callees whose result is thrown away (`log_storage_event(..);` as a
+/// statement). A helper that only *returns* the caller identity cannot possibly
+/// authorize a frame that discards what it hands back.
+struct DiscardedCalleeCollector {
+    calls: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for DiscardedCalleeCollector {
+    fn visit_stmt(&mut self, node: &'ast Stmt) {
+        if let Stmt::Expr(expr, Some(_)) = node {
+            if let Some(name) = call_target_name(expr) {
+                self.calls.push(name);
+            }
+        }
+        syn::visit::visit_stmt(self, node);
+    }
+}
+
+/// Names of callees invoked purely for effect within a block.
+fn collect_discarded_callees_block(block: &Block) -> Vec<String> {
+    let mut collector = DiscardedCalleeCollector { calls: Vec::new() };
+    collector.visit_block(block);
+    collector.calls
+}
+
+/// Collects the callees a block invokes *with a caller-identity argument*
+/// (`self.internal_withdraw(&caller, ..)`). This is what delegation *up* really
+/// looks like: the resolved identity has to reach the call site, not merely
+/// appear somewhere in the caller's body.
+struct IdentityArgCollector<'t> {
+    taint: &'t HashSet<String>,
+    calls: Vec<String>,
+}
+
+impl<'ast, 't> Visit<'ast> for IdentityArgCollector<'t> {
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if node
+            .args
+            .iter()
+            .any(|arg| expr_reads_predecessor(arg, self.taint))
+        {
+            if let Expr::Path(ExprPath { path, .. }) = node.func.as_ref() {
+                if let Some(segment) = path.segments.last() {
+                    self.calls.push(segment.ident.to_string());
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        if node
+            .args
+            .iter()
+            .any(|arg| expr_reads_predecessor(arg, self.taint))
+        {
+            self.calls.push(node.method.to_string());
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Names of callees this block hands a resolved caller identity to.
+fn collect_identity_arg_callees(block: &Block) -> Vec<String> {
+    let taint = predecessor_taint(block);
+    let mut collector = IdentityArgCollector {
+        taint: &taint,
+        calls: Vec::new(),
+    };
+    collector.visit_block(block);
+    collector.calls
+}
+
+/// Visitor that records, for each non-test function/method in the file, what it
+/// does with the caller identity and which callees it passes that identity to.
 struct FnDefCollector {
-    bodies: HashMap<String, String>,
-    calls: HashMap<String, Vec<String>>,
+    roles: HashMap<String, CallerIdentityRole>,
+    identity_args: HashMap<String, Vec<String>>,
 }
 
 impl FnDefCollector {
-    fn record(&mut self, name: String, block: &Block) {
-        self.bodies
-            .insert(name.clone(), block.to_token_stream().to_string());
-        self.calls.insert(name, collect_callees_block(block));
+    fn record(&mut self, name: String, sig: &Signature, block: &Block) {
+        if let Some(role) = classify_caller_identity(sig, block) {
+            self.roles.insert(name.clone(), role);
+        }
+        self.identity_args
+            .insert(name, collect_identity_arg_callees(block));
     }
 }
 
@@ -147,14 +527,14 @@ impl<'ast> Visit<'ast> for FnDefCollector {
 
     fn visit_item_fn(&mut self, func: &'ast ItemFn) {
         if !is_test_fn(&func.attrs) {
-            self.record(func.sig.ident.to_string(), &func.block);
+            self.record(func.sig.ident.to_string(), &func.sig, &func.block);
         }
         syn::visit::visit_item_fn(self, func);
     }
 
     fn visit_impl_item_fn(&mut self, func: &'ast syn::ImplItemFn) {
         if !is_test_fn(&func.attrs) {
-            self.record(func.sig.ident.to_string(), &func.block);
+            self.record(func.sig.ident.to_string(), &func.sig, &func.block);
         }
         syn::visit::visit_impl_item_fn(self, func);
     }
@@ -184,34 +564,47 @@ impl<'ast> Visit<'ast> for CalleeCollector {
 struct StorageVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     ctx: &'a ScanContext,
-    bodies: &'a HashMap<String, String>,
-    calls: &'a HashMap<String, Vec<String>>,
+    roles: &'a HashMap<String, CallerIdentityRole>,
+    identity_args: &'a HashMap<String, Vec<String>>,
 }
 
 impl<'a> StorageVisitor<'a> {
     /// Authorization delegated *down*: the flagged function calls a same-file
-    /// helper whose own body resolves `predecessor_account_id` (idiomatic
+    /// helper that actually acts on `predecessor_account_id` (idiomatic
     /// `assert_registered_caller()` / `assert_owner()` factoring).
+    ///
+    /// The helper must *do* something with the caller identity, not merely
+    /// mention it: a helper that formats the caller into a log line performs no
+    /// comparison and no assertion, and suppressing on it hides a real drain.
     fn auth_in_callees(&self, func: &ItemFn) -> bool {
-        collect_callees_block(&func.block).iter().any(|callee| {
-            self.bodies
-                .get(callee)
-                .is_some_and(|body| body.contains("predecessor_account_id"))
+        let callees = collect_callees_block(&func.block);
+        let discarded = collect_discarded_callees_block(&func.block);
+        callees.iter().any(|callee| match self.roles.get(callee) {
+            // A helper that asserts on the caller authorizes this frame however
+            // its result is used — the assertion fires either way.
+            Some(CallerIdentityRole::Enforces) => true,
+            // A helper that only *resolves* the identity authorizes nothing
+            // unless this frame actually consumes what it hands back.
+            Some(CallerIdentityRole::Resolves) => {
+                let total = callees.iter().filter(|c| *c == callee).count();
+                let dropped = discarded.iter().filter(|c| *c == callee).count();
+                total > dropped
+            }
+            None => false,
         })
     }
 
-    /// Authorization delegated *up*: a trusted same-file caller invokes this
-    /// function and performs the `predecessor_account_id` check itself, passing
-    /// the resolved account identity down (the NEP-145 public/internal layering).
+    /// Authorization delegated *up*: a trusted same-file caller resolves the
+    /// predecessor identity and passes it *into* this function as an argument
+    /// (the NEP-145 public/internal layering).
+    ///
+    /// Requires the identity to reach the call site. A caller that merely
+    /// mentions `predecessor_account_id` somewhere else in its body (logging it,
+    /// say) delegates nothing and must not suppress the finding.
     fn auth_in_callers(&self, fn_name: &str) -> bool {
-        self.calls.iter().any(|(caller, callees)| {
-            caller != fn_name
-                && callees.iter().any(|c| c == fn_name)
-                && self
-                    .bodies
-                    .get(caller)
-                    .is_some_and(|body| body.contains("predecessor_account_id"))
-        })
+        self.identity_args
+            .iter()
+            .any(|(caller, callees)| caller != fn_name && callees.iter().any(|c| c == fn_name))
     }
 }
 
@@ -488,6 +881,185 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Test-harness functions should not be flagged"
+        );
+    }
+
+    // REGRESSION (ADV-206 false negative). The `auth_in_callees` guard skipped
+    // any handler that called a same-file helper whose body merely *contained*
+    // the `predecessor_account_id` token. `log_storage_event` below only formats
+    // the caller into a log line — no comparison, no assertion — so it cannot
+    // authorize anything, yet it silenced the detector on a handler that lets
+    // anyone drain any account's staked storage deposit:
+    // `storage_withdraw(victim.near, attacker.near, victim_balance)`.
+    #[test]
+    fn test_still_flags_withdraw_when_helper_only_logs_caller() {
+        let source = r#"
+            fn log_storage_event(kind: &str, subject: &AccountId) {
+                env::log_str(&format!(
+                    "storage_event kind={} subject={} caller={}",
+                    kind,
+                    subject,
+                    env::predecessor_account_id()
+                ));
+            }
+
+            #[payable]
+            pub fn storage_withdraw(
+                &mut self,
+                account_id: AccountId,
+                receiver_id: Option<AccountId>,
+                amount: U128,
+            ) -> StorageBalance {
+                log_storage_event("withdraw", &account_id);
+
+                let mut balance = self.accounts.get(&account_id).expect("not registered");
+                let to_withdraw: Balance = amount.0;
+                assert!(balance.available >= to_withdraw, "insufficient available");
+
+                balance.available -= to_withdraw;
+                balance.total -= to_withdraw;
+                self.accounts.insert(&account_id, &balance);
+
+                let beneficiary = receiver_id.unwrap_or(account_id);
+                Promise::new(beneficiary).transfer(to_withdraw);
+
+                balance
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "NEAR-003"),
+            "Handler whose helper only logs the caller must still be flagged"
+        );
+    }
+
+    // Same bug class, message position: the caller appears only in an assertion's
+    // *format arguments*. `assert!(cond, "denied for {}", caller)` decides nothing
+    // about the caller and must not suppress.
+    #[test]
+    fn test_still_flags_when_caller_only_in_assert_message() {
+        let source = r#"
+            fn require_liquidity(&self, needed: Balance) {
+                assert!(
+                    self.pool >= needed,
+                    "insufficient pool for {}",
+                    env::predecessor_account_id()
+                );
+            }
+            pub fn storage_withdraw(&mut self, account_id: AccountId, amount: U128) -> StorageBalance {
+                self.require_liquidity(amount.0);
+                let mut balance = self.accounts.get(&account_id).expect("not registered");
+                balance.available -= amount.0;
+                self.accounts.insert(&account_id, &balance);
+                Promise::new(account_id).transfer(amount.0);
+                balance
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "NEAR-003"),
+            "Caller mentioned only in an assert message must not suppress the finding"
+        );
+    }
+
+    // Same bug class, delegation *up*: a caller that only logs the predecessor
+    // hands no identity down, so the internal helper is still unauthorized.
+    #[test]
+    fn test_still_flags_internal_helper_when_caller_only_logs_predecessor() {
+        let source = r#"
+            pub fn storage_withdraw(&mut self, account_id: AccountId, amount: Option<U128>) -> bool {
+                env::log_str(&format!("caller={}", env::predecessor_account_id()));
+                self.internal_storage_withdraw(&account_id, amount.map(|a| a.0));
+                true
+            }
+            fn internal_storage_withdraw(&mut self, account_id: &AccountId, amount: Option<Balance>) -> StorageBalance {
+                let mut balance = self.accounts.get(account_id).expect("not registered");
+                let to_withdraw = amount.unwrap_or(balance.available);
+                balance.available -= to_withdraw;
+                self.accounts.insert(account_id, &balance);
+                Promise::new(account_id.clone()).transfer(to_withdraw);
+                balance
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("internal_storage_withdraw")),
+            "Internal helper whose caller only logs the predecessor must still be flagged"
+        );
+    }
+
+    // A helper that resolves the caller identity but whose result the handler
+    // throws away authorizes nothing.
+    #[test]
+    fn test_still_flags_when_resolver_result_discarded() {
+        let source = r#"
+            fn resolve_caller(&self) -> AccountId {
+                env::predecessor_account_id()
+            }
+            pub fn storage_withdraw(&mut self, account_id: AccountId, amount: U128) -> StorageBalance {
+                self.resolve_caller();
+                let mut balance = self.accounts.get(&account_id).expect("not registered");
+                balance.available -= amount.0;
+                self.accounts.insert(&account_id, &balance);
+                Promise::new(account_id).transfer(amount.0);
+                balance
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "NEAR-003"),
+            "Discarded identity resolver must not suppress the finding"
+        );
+    }
+
+    // Converse of the above: a helper that resolves the caller identity AND whose
+    // result the handler actually uses is genuine authorization.
+    #[test]
+    fn test_no_finding_when_resolver_result_used() {
+        let source = r#"
+            fn resolve_caller(&self) -> AccountId {
+                env::predecessor_account_id()
+            }
+            pub fn storage_withdraw(&mut self, amount: U128) -> StorageBalance {
+                let account_id = self.resolve_caller();
+                let mut balance = self.accounts.get(&account_id).expect("not registered");
+                balance.available -= amount.0;
+                self.accounts.insert(&account_id, &balance);
+                Promise::new(account_id).transfer(amount.0);
+                balance
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Consumed identity resolver is real authorization and should not be flagged"
+        );
+    }
+
+    // A rejecting `if` guard on the caller is enforcement even without a macro.
+    #[test]
+    fn test_no_finding_auth_via_rejecting_if_guard() {
+        let source = r#"
+            fn assert_owner(&self) {
+                if env::predecessor_account_id() != self.owner {
+                    env::panic_str("unauthorized");
+                }
+            }
+            pub fn storage_withdraw(&mut self, account_id: AccountId, amount: U128) -> StorageBalance {
+                self.assert_owner();
+                let mut balance = self.accounts.get(&account_id).expect("not registered");
+                balance.available -= amount.0;
+                self.accounts.insert(&account_id, &balance);
+                Promise::new(account_id).transfer(amount.0);
+                balance
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Rejecting if-guard on the caller should not be flagged"
         );
     }
 

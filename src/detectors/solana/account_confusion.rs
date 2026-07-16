@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use quote::ToTokens;
 use syn::visit::Visit;
-use syn::{Attribute, ItemFn, ItemMod};
+use syn::{Attribute, Expr, ItemFn, ItemMod};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -56,24 +56,26 @@ impl Detector for AccountConfusionDetector {
             return Vec::new();
         }
 
-        // Build a map of every locally-defined function's body source so that a
-        // discriminator check factored out into a helper can be resolved.
+        // Build a map of every locally-defined function's body AST so that a
+        // discriminator check factored out into a helper can be resolved. The
+        // block is kept as syntax (not source text) because deciding whether a
+        // helper *performs* a type check requires structure, not spelling.
         let mut fn_collector = FunctionCollector {
             functions: Vec::new(),
         };
         fn_collector.visit_file(&ctx.ast);
-        let mut local_fn_bodies: HashMap<String, String> = HashMap::new();
+        let mut local_fn_blocks: HashMap<String, syn::Block> = HashMap::new();
         for f in &fn_collector.functions {
-            local_fn_bodies
+            local_fn_blocks
                 .entry(f.sig.ident.to_string())
-                .or_insert_with(|| fn_body_source(f));
+                .or_insert_with(|| (*f.block).clone());
         }
 
         let mut findings = Vec::new();
         let mut visitor = ConfusionVisitor {
             findings: &mut findings,
             ctx,
-            local_fn_bodies: &local_fn_bodies,
+            local_fn_blocks: &local_fn_blocks,
         };
         visitor.visit_file(&ctx.ast);
         findings
@@ -83,7 +85,7 @@ impl Detector for AccountConfusionDetector {
 struct ConfusionVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     ctx: &'a ScanContext,
-    local_fn_bodies: &'a HashMap<String, String>,
+    local_fn_blocks: &'a HashMap<String, syn::Block>,
 }
 
 impl<'ast, 'a> Visit<'ast> for ConfusionVisitor<'a> {
@@ -172,15 +174,18 @@ impl<'ast, 'a> Visit<'ast> for ConfusionVisitor<'a> {
 
         // A discriminator/tag check may be factored into a helper. Resolve the
         // bodies of locally-called functions and treat this function as safe if
-        // any of them performs the check (the `?`/early-return propagates the
-        // failure before deserialization).
+        // any of them actually performs the check (the `?`/early-return
+        // propagates the failure before deserialization). The helper must be
+        // shown to *compare* a type tag: a helper that merely validates owner,
+        // length or an init flag leaves account-type confusion wide open and
+        // must not suppress the finding.
         let mut helper_checks_discriminator = false;
         for name in collect_call_names(func) {
             if name == fn_name {
                 continue;
             }
-            if let Some(helper_body) = self.local_fn_bodies.get(&name) {
-                if body_has_discriminator_check(helper_body) {
+            if let Some(helper_block) = self.local_fn_blocks.get(&name) {
+                if block_has_discriminator_check(helper_block) {
                     helper_checks_discriminator = true;
                     break;
                 }
@@ -188,8 +193,7 @@ impl<'ast, 'a> Visit<'ast> for ConfusionVisitor<'a> {
         }
 
         // Check for discriminator check (first 8 bytes)
-        let has_discriminator = body_has_discriminator_check(&body_src)
-            || fn_src.contains("IsInitialized")
+        let has_discriminator = block_has_discriminator_check(&func.block)
             || spl_checked_unpack
             || anchor_checked_deser
             || helper_checks_discriminator;
@@ -216,23 +220,237 @@ impl<'ast, 'a> Visit<'ast> for ConfusionVisitor<'a> {
     }
 }
 
-/// Returns true if the given function-body token source contains a recognizable
-/// first-8-bytes discriminator / type-tag check. Accepts the several token-stream
-/// spellings of a `data[..8]` read (`[.. 8]`, `[0 .. 8]`, `.get (.. 8)`), as well
-/// as the common named-check conventions (`DISCRIMINATOR`, `is_initialized`, ...).
-fn body_has_discriminator_check(body_src: &str) -> bool {
-    body_src.contains("discriminator")
-        || body_src.contains("DISCRIMINATOR")
-        || body_src.contains("[.. 8]")
-        || body_src.contains("[..8]")
-        || body_src.contains("[0 .. 8]")
-        || body_src.contains("[0..8]")
-        || body_src.contains(". get (.. 8)")
-        || body_src.contains(".get(..8)")
-        || body_src.contains("account_type")
-        || body_src.contains("is_initialized")
-        || body_src.contains("IsInitialized")
-        || body_src.contains("assert_initialized")
+/// Returns true if `block` performs a real account-type (discriminator / tag)
+/// check.
+///
+/// This is deliberately structural rather than textual: the tag value must take
+/// part in an `==`/`!=` comparison, a slice comparison (`starts_with`/`eq`), an
+/// assertion condition, a `match` scrutinee, or be handed to a fallible check
+/// whose failure propagates. Merely *mentioning* a tag-ish identifier is not a
+/// check -- the previous substring oracle silenced this detector on genuinely
+/// vulnerable code for exactly that reason.
+fn block_has_discriminator_check(block: &syn::Block) -> bool {
+    let mut visitor = DiscriminatorCheckVisitor { found: false };
+    visitor.visit_block(block);
+    visitor.found
+}
+
+/// Identifiers that name an account *type tag* (discriminator).
+///
+/// Initialization markers (`is_initialized`, `init_flag`, `IsInitialized`,
+/// `assert_initialized`) are deliberately absent: an init flag distinguishes a
+/// zeroed account from a written one, never a `Vault` from a byte-compatible
+/// `UserProfile`. Treating one as the other is a false negative, not a check.
+/// Likewise owner and length checks are not type checks.
+fn is_type_tag_ident(ident: &str) -> bool {
+    let lower = ident.to_ascii_lowercase();
+    lower.contains("discriminator")
+        || lower.contains("account_type")
+        || lower.contains("accounttype")
+        || lower.contains("type_tag")
+        || lower == "tag"
+        || lower.ends_with("_tag")
+        || lower.starts_with("tag_")
+}
+
+/// Strip the wrappers that do not change which value an expression reads.
+fn peel(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(e) => peel(&e.expr),
+        Expr::Group(e) => peel(&e.expr),
+        Expr::Reference(e) => peel(&e.expr),
+        other => other,
+    }
+}
+
+/// Parse an expression as a `usize` literal.
+fn lit_usize(expr: &Expr) -> Option<u64> {
+    match peel(expr) {
+        Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Int(i) => i.base10_parse::<u64>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns true for a range selecting exactly the first 8 bytes: `..8`, `0..8`,
+/// `..=7` or `0..=7` -- i.e. the Anchor/Borsh discriminator window.
+fn is_eight_byte_prefix(expr: &Expr) -> bool {
+    let range = match peel(expr) {
+        Expr::Range(range) => range,
+        _ => return false,
+    };
+    let start_ok = match &range.start {
+        None => true,
+        Some(start) => lit_usize(start) == Some(0),
+    };
+    if !start_ok {
+        return false;
+    }
+    let end = match &range.end {
+        Some(end) => match lit_usize(end) {
+            Some(end) => end,
+            None => return false,
+        },
+        None => return false,
+    };
+    match range.limits {
+        syn::RangeLimits::HalfOpen(_) => end == 8,
+        syn::RangeLimits::Closed(_) => end == 7,
+    }
+}
+
+/// Returns true if `expr` reads an account type tag: a first-8-bytes window of
+/// some buffer, or a path/field named after a discriminator or type tag.
+fn expr_reads_type_tag(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(path) => path
+            .path
+            .segments
+            .iter()
+            .any(|seg| is_type_tag_ident(&seg.ident.to_string())),
+        Expr::Field(field) => {
+            if let syn::Member::Named(name) = &field.member {
+                if is_type_tag_ident(&name.to_string()) {
+                    return true;
+                }
+            }
+            expr_reads_type_tag(&field.base)
+        }
+        // `data[..8]` / `data[0..8]`
+        Expr::Index(index) => {
+            is_eight_byte_prefix(&index.index) || expr_reads_type_tag(&index.expr)
+        }
+        Expr::MethodCall(call) => {
+            let method = call.method.to_string();
+            // `data.get(..8)`
+            if matches!(method.as_str(), "get" | "get_unchecked")
+                && call.args.iter().any(is_eight_byte_prefix)
+            {
+                return true;
+            }
+            if is_type_tag_ident(&method) {
+                return true;
+            }
+            expr_reads_type_tag(&call.receiver)
+        }
+        // `u64::from_le_bytes(data[..8].try_into()?)`
+        Expr::Call(call) => call.args.iter().any(expr_reads_type_tag),
+        Expr::Reference(e) => expr_reads_type_tag(&e.expr),
+        Expr::Paren(e) => expr_reads_type_tag(&e.expr),
+        Expr::Group(e) => expr_reads_type_tag(&e.expr),
+        Expr::Unary(e) => expr_reads_type_tag(&e.expr),
+        Expr::Cast(e) => expr_reads_type_tag(&e.expr),
+        Expr::Try(e) => expr_reads_type_tag(&e.expr),
+        _ => false,
+    }
+}
+
+/// Returns true if `mac` is an assertion whose condition mentions a type tag.
+/// A macro body is an opaque token stream, so inside the condition of an
+/// assertion -- which is a check by construction -- we fall back to recognising
+/// the tag vocabulary and the token-stream spellings of a first-8-bytes read.
+fn macro_asserts_type_tag(mac: &syn::Macro) -> bool {
+    let name = match mac.path.segments.last() {
+        Some(seg) => seg.ident.to_string(),
+        None => return false,
+    };
+    let is_assertion = matches!(
+        name.as_str(),
+        "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "require"
+            | "require_eq"
+            | "require_neq"
+            | "require_keys_eq"
+            | "require_keys_neq"
+    );
+    if !is_assertion {
+        return false;
+    }
+    let toks = mac.tokens.to_string();
+    let lower = toks.to_ascii_lowercase();
+    lower.contains("discriminator")
+        || lower.contains("account_type")
+        || lower.contains("accounttype")
+        || lower.contains("_tag")
+        || toks.contains("[.. 8]")
+        || toks.contains("[0 .. 8]")
+        || toks.contains(". get (.. 8)")
+        || toks.contains(". get (0 .. 8)")
+}
+
+/// Walks a function body looking for a structural account-type check.
+struct DiscriminatorCheckVisitor {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for DiscriminatorCheckVisitor {
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        // The tag must appear as an operand of an equality comparison. An
+        // ordering/arithmetic operator over a tag is not a type check.
+        if matches!(node.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+            && (expr_reads_type_tag(&node.left) || expr_reads_type_tag(&node.right))
+        {
+            self.found = true;
+        }
+        syn::visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // Slice-wise comparisons: `data.starts_with(&Pool::DISCRIMINATOR)`.
+        let method = node.method.to_string();
+        if matches!(
+            method.as_str(),
+            "starts_with" | "eq" | "ne" | "cmp" | "contains" | "eq_ignore_ascii_case"
+        ) && (expr_reads_type_tag(&node.receiver) || node.args.iter().any(expr_reads_type_tag))
+        {
+            self.found = true;
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        // `match header.account_type { ... }` dispatches on the tag.
+        if expr_reads_type_tag(&node.expr) {
+            self.found = true;
+        }
+        syn::visit::visit_expr_match(self, node);
+    }
+
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        // `verify_tag(data, Pool::DISCRIMINATOR)?` -- a fallible call handed the
+        // expected tag, whose failure propagates before deserialization. The
+        // comparison itself may live in a callee we cannot resolve, but the tag
+        // is demonstrably the value being checked.
+        match peel(&node.expr) {
+            Expr::Call(call) if call.args.iter().any(expr_reads_type_tag) => self.found = true,
+            Expr::MethodCall(call) if call.args.iter().any(expr_reads_type_tag) => {
+                self.found = true
+            }
+            _ => {}
+        }
+        syn::visit::visit_expr_try(self, node);
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        if macro_asserts_type_tag(&node.mac) {
+            self.found = true;
+        }
+        syn::visit::visit_expr_macro(self, node);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        if macro_asserts_type_tag(&node.mac) {
+            self.found = true;
+        }
+        syn::visit::visit_stmt_macro(self, node);
+    }
 }
 
 /// Returns true if any attribute is a `#[cfg(test)]` gate.
@@ -423,6 +641,104 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "A non-checking helper must not suppress the finding"
+        );
+    }
+
+    // --- REGRESSION GUARD (false negative): an init-flag check is not a type
+    // check. `Vault` and `UserProfile` have identical wire layouts and both are
+    // owned by the program, so a helper that validates owner + length + the
+    // init byte lets an attacker pass a `UserProfile` where a `Vault` is
+    // expected. The helper only *mentions* `is_initialized`; it never compares
+    // an account-type tag. This MUST still flag.
+    #[test]
+    fn test_still_flags_init_only_helper_without_type_check() {
+        let source = r#"
+            fn validate_vault_account(info: &AccountInfo, program_id: &Pubkey) -> ProgramResult {
+                if info.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                let data = info.data.borrow();
+                if data.len() < VAULT_LEN {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+                let is_initialized = data[0] != 0;
+                if !is_initialized {
+                    return Err(ProgramError::UninitializedAccount);
+                }
+                Ok(())
+            }
+
+            pub fn withdraw_from_vault(
+                program_id: &Pubkey,
+                accounts: &[AccountInfo],
+                amount: u64,
+            ) -> ProgramResult {
+                let vault_info = &accounts[0];
+                validate_vault_account(vault_info, program_id)?;
+                let vault = Vault::try_from_slice(&vault_info.data.borrow())?;
+                if amount > vault.amount {
+                    return Err(ProgramError::InsufficientFunds);
+                }
+                **vault_info.try_borrow_mut_lamports()? -= amount;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A helper checking owner/length/init but never the account TYPE must not suppress: \
+             a byte-compatible account of another type still passes it"
+        );
+    }
+
+    // Same vulnerability with the init check spelled inline rather than bound to
+    // a local. Neither spelling is a type check; both must flag.
+    #[test]
+    fn test_still_flags_inline_init_check_without_type_check() {
+        let source = r#"
+            fn validate_vault_account(info: &AccountInfo, program_id: &Pubkey) -> ProgramResult {
+                if info.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                let data = info.data.borrow();
+                if data[0] == 0 {
+                    return Err(ProgramError::UninitializedAccount);
+                }
+                Ok(())
+            }
+
+            pub fn withdraw_from_vault(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let vault_info = &accounts[0];
+                validate_vault_account(vault_info, program_id)?;
+                let vault = Vault::try_from_slice(&vault_info.data.borrow())?;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "An inline init-flag check is not an account-type check and must not suppress"
+        );
+    }
+
+    // The tag vocabulary must be *used*, not merely mentioned: a helper that
+    // names a discriminator in a log line performs no check at all.
+    #[test]
+    fn test_still_flags_discriminator_only_mentioned_in_log() {
+        let source = r#"
+            fn note_load(info: &AccountInfo) {
+                msg!("loading account, discriminator not verified");
+            }
+
+            fn load_pool(info: &AccountInfo) -> Result<Pool, ProgramError> {
+                note_load(info);
+                Pool::try_from_slice(&info.data.borrow()).map_err(|_| ProgramError::InvalidAccountData)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Mentioning 'discriminator' in a log string is not a discriminator check"
         );
     }
 

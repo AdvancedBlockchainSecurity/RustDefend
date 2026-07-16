@@ -1,7 +1,6 @@
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
 use crate::scanner::finding::*;
-use quote::ToTokens;
 use syn::visit::Visit;
 
 pub struct ReentrancyDetector;
@@ -66,16 +65,63 @@ struct ReentryVisitor {
     hits: Vec<ReentryHit>,
 }
 
+/// Parse the comma-separated predicates inside a `cfg`-like list, e.g. the
+/// `test, feature = "std"` of `all(test, feature = "std")`.
+fn cfg_predicates(
+    list: &syn::MetaList,
+) -> Option<syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>> {
+    list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .ok()
+}
+
+/// True if the predicate holds *only* in test builds — i.e. it implies `test`.
+///
+/// This is a structural implication check, not a search for the token `test`.
+/// The distinction is the whole point: `#[cfg(not(test))]` mentions `test` but
+/// gates the code that ships on-chain, so it must never be treated as test-only.
+fn cfg_implies_test(meta: &syn::Meta) -> bool {
+    match meta {
+        // Bare `test`: compiled in only under `cargo test`.
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) => {
+            let Some(nested) = cfg_predicates(list) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                // `all(..)` is a conjunction: one test-only conjunct is enough to
+                // confine the whole item to test builds.
+                nested.iter().any(cfg_implies_test)
+            } else if list.path.is_ident("any") {
+                // `any(..)` is a disjunction: test-only only if *every* alternative
+                // is, otherwise some non-test build still compiles the item.
+                !nested.is_empty() && nested.iter().all(cfg_implies_test)
+            } else {
+                // `not(..)` never implies `test` for any predicate we model, and an
+                // unknown predicate says nothing about test builds.
+                false
+            }
+        }
+        // `feature = "std"`, `target_os = "..."`, ... : not a statement about tests.
+        syn::Meta::NameValue(_) => false,
+    }
+}
+
 /// True if the item is test-only scaffolding: `#[test]`, `#[ink::test]`,
-/// `#[tokio::test]`, or gated behind `#[cfg(test)]`. Such code is never part of
-/// the deployed contract, so reentrancy inside it is not a live vulnerability.
+/// `#[tokio::test]`, or gated behind a cfg that implies `test`. Such code is
+/// never part of the deployed contract, so reentrancy inside it is not a live
+/// vulnerability. Production-only gates such as `#[cfg(not(test))]` are *not*
+/// test items — that code is exactly what runs on-chain.
 fn is_test_item(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         let path = attr.path();
-        // #[cfg(test)] (also matches #[cfg(all(test, ...))] etc.)
+        // #[cfg(test)], #[cfg(all(test, ...))], #[cfg(any(test, ink::test))], ...
         if path.is_ident("cfg") {
-            let toks = attr.meta.to_token_stream().to_string();
-            return toks.contains("test");
+            return match &attr.meta {
+                syn::Meta::List(list) => cfg_predicates(list)
+                    .map(|nested| nested.iter().any(cfg_implies_test))
+                    .unwrap_or(false),
+                _ => false,
+            };
         }
         // #[test], #[ink::test], #[tokio::test], #[async_std::test], ...
         matches!(path.segments.last(), Some(seg) if seg.ident == "test")
@@ -249,6 +295,84 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag set_allow_reentry(true) inside comments or string literals"
+        );
+    }
+
+    // must_still_fire: `#[cfg(not(test))]` gates the code that SHIPS ON-CHAIN.
+    // The test guard must not skip it just because the predicate spells "test".
+    #[test]
+    fn test_still_flags_cfg_not_test_production_fn() {
+        let source = r#"
+            #[ink::contract]
+            mod vault {
+            impl Vault {
+                #[cfg(not(test))]
+                #[ink(message)]
+                pub fn withdraw(&mut self, amount: Balance, callback_target: AccountId) -> Result<(), Error> {
+                    let caller = self.env().caller();
+                    let bal = self.balances.get(caller).unwrap_or(0);
+                    if bal < amount {
+                        return Err(Error::InsufficientBalance);
+                    }
+                    build_call::<DefaultEnvironment>()
+                        .call(callback_target)
+                        .call_flags(CallFlags::default().set_allow_reentry(true))
+                        .returns::<()>()
+                        .invoke()
+                        .map_err(|_| Error::CallFailed)?;
+                    self.balances.insert(caller, &(bal - amount));
+                    Ok(())
+                }
+
+                #[cfg(test)]
+                #[ink(message)]
+                pub fn withdraw(&mut self, amount: Balance, _callback_target: AccountId) -> Result<(), Error> {
+                    let caller = self.env().caller();
+                    let bal = self.balances.get(caller).unwrap_or(0);
+                    self.balances.insert(caller, &(bal - amount));
+                    Ok(())
+                }
+            }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert_eq!(
+            findings.len(),
+            1,
+            "Should flag set_allow_reentry(true) in a #[cfg(not(test))] production fn"
+        );
+    }
+
+    // `any(test, feature = "e2e")` still compiles outside test builds when the
+    // feature is on, so it is not test-only scaffolding.
+    #[test]
+    fn test_still_flags_cfg_any_test_or_feature() {
+        let source = r#"
+            #[cfg(any(test, feature = "e2e"))]
+            fn forward(&mut self) {
+                self.env().set_allow_reentry(true);
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag when the cfg predicate also admits a non-test build"
+        );
+    }
+
+    // Guard: `all(test, ..)` is still test-only — one test conjunct confines it.
+    #[test]
+    fn test_no_finding_in_cfg_all_test_fn() {
+        let source = r#"
+            #[cfg(all(test, feature = "std"))]
+            fn helper(&mut self) {
+                self.env().set_allow_reentry(true);
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag set_allow_reentry(true) inside a #[cfg(all(test, ...))] fn"
         );
     }
 

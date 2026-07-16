@@ -145,11 +145,10 @@ impl<'ast, 'a> Visit<'ast> for SignerVisitor<'a> {
             return;
         }
 
-        let body_src = fn_body_source(func);
         // Token-stream body with string-literal contents removed, so that words
         // appearing only inside `msg!("...")` / error strings cannot be mistaken
         // for real code (guards against FP idx 4).
-        let clean_body = strip_string_literals(&body_src);
+        let clean_body = strip_string_literals(&fn_body_source(func));
 
         // Skip if this uses Anchor's Signer<'info> or Account<'info, T> patterns
         let fn_src = func.to_token_stream().to_string();
@@ -220,10 +219,18 @@ impl<'ast, 'a> Visit<'ast> for SignerVisitor<'a> {
         //     to actually contain an is_signer/has_signer check (FP idx 0, the
         //     `validate_authority(acct)?` case). This is a *resolved* delegation,
         //     not a name-based skip.
-        let has_signer_check = body_src.contains("is_signer")
-            || body_src.contains("has_signer")
-            || clean_body.contains("signer_key")
-            || body_calls_signer_assert_helper(&clean_body)
+        //
+        // Every arm below is resolved from the AST rather than by a substring
+        // scan of the body text: the signer property must be *touched* by real
+        // code, and a helper must be *called* under its exact identifier. A body
+        // that merely spells a signer-ish word — `validate_signer_seeds(..)`,
+        // which only validates PDA seeds — enforces nothing and must not suppress.
+        let has_signer_check = body_touches_signer_property(&func.block)
+            || calls_signer_assert_helper(
+                &func.block,
+                &self.ctx.call_graph,
+                Some(&unchecked_params),
+            )
             || callee_checks_signer(&self.ctx.call_graph, &fn_name);
 
         // Check if the function does any state mutations.
@@ -251,7 +258,11 @@ impl<'ast, 'a> Visit<'ast> for SignerVisitor<'a> {
                 &self.ctx.call_graph,
                 &fn_name,
                 CheckKind::SignerCheck,
-            ) || impl_method_caller_checks_signer(&self.ctx.ast, &fn_name))
+            ) || impl_method_caller_checks_signer(
+                &self.ctx.ast,
+                &self.ctx.call_graph,
+                &fn_name,
+            ))
         {
             return;
         }
@@ -317,20 +328,225 @@ fn strip_string_literals(src: &str) -> String {
     out
 }
 
-/// Returns true if the (string-literal-stripped) body calls a signer-assertion
-/// helper such as `assert_signer`, `require_signer`, `validate_signer`,
-/// `check_is_signer`, etc. These snake_case helper names verify signer status by
-/// construction (e.g. Metaplex `mpl_utils::assert_signer`, whose body is
-/// `if !info.is_signer { return Err(MissingRequiredSignature) }`), so the `?`
-/// propagation of their result aborts the function before any mutation.
+/// The identifiers that name the signer property itself. Touching any of these
+/// in real code is what actually reads signer status:
+///   * `is_signer` / `has_signer` — the AccountInfo field.
+///   * `signer_key` — solana_program getter returning Some(&Pubkey) iff signed.
+const SIGNER_PROPERTY_IDENTS: [&str; 3] = ["is_signer", "has_signer", "signer_key"];
+
+/// Returns true if `block` touches the signer property as *code*: a field access
+/// (`authority.is_signer`), a method call (`authority.signer_key()`), a path
+/// (`AccountInfo::is_signer(a)`), or an identifier inside a macro invocation
+/// (`assert!(authority.is_signer)` — syn keeps macro bodies as opaque tokens, so
+/// those are scanned at the token level, where an `Ident` is still a whole
+/// identifier and string literals are `Literal`s that can never match).
 ///
-/// Only snake_case `verb_signer` / `verb_is_signer` identifier forms are matched,
-/// so PascalCase items like an error variant `SignerCheckMissing` do NOT match —
-/// avoiding accidental suppression of a real finding.
-fn body_calls_signer_assert_helper(body: &str) -> bool {
+/// This replaces a `body.contains("is_signer")` scan, which had neither
+/// identifier boundaries nor any notion of use: it fired on `msg!("is_signer")`
+/// and on unrelated identifiers that merely embed the word.
+fn body_touches_signer_property(block: &syn::Block) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl Finder {
+        fn hit(&mut self, ident: &syn::Ident) {
+            if SIGNER_PROPERTY_IDENTS.contains(&ident.to_string().as_str()) {
+                self.found = true;
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+            if let syn::Member::Named(ident) = &node.member {
+                self.hit(ident);
+            }
+            syn::visit::visit_expr_field(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            self.hit(&node.method);
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_path(&mut self, node: &'ast syn::Path) {
+            for seg in &node.segments {
+                self.hit(&seg.ident);
+            }
+            syn::visit::visit_path(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if tokens_contain_ident(node.tokens.clone(), &SIGNER_PROPERTY_IDENTS) {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, node);
+        }
+    }
+
+    let mut finder = Finder { found: false };
+    finder.visit_block(block);
+    finder.found
+}
+
+/// Recursively scan a token stream for any of `idents` as a whole `Ident` token.
+/// Used for macro bodies, which syn does not parse into expressions.
+fn tokens_contain_ident(tokens: proc_macro2::TokenStream, idents: &[&str]) -> bool {
+    for tt in tokens {
+        match tt {
+            proc_macro2::TokenTree::Ident(i) => {
+                if idents.contains(&i.to_string().as_str()) {
+                    return true;
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                if tokens_contain_ident(g.stream(), idents) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Returns true if `name` is *exactly* one of the signer-assertion helper forms
+/// (`assert_signer`, `require_signer`, `validate_signer`, `check_is_signer`, …).
+///
+/// The comparison is an equality test on a whole call-site identifier, not a
+/// substring test on body text. The old substring form had no trailing boundary,
+/// so `validate_signer_seeds` — a PDA-seed check that performs no signer
+/// verification whatsoever — matched `validate_signer` and silenced a real
+/// finding.
+fn is_signer_assert_helper_name(name: &str) -> bool {
     const VERBS: [&str; 6] = ["assert", "require", "check", "verify", "validate", "ensure"];
-    for v in VERBS {
-        if body.contains(&format!("{}_signer", v)) || body.contains(&format!("{}_is_signer", v)) {
+    VERBS
+        .iter()
+        .any(|v| name == format!("{}_signer", v) || name == format!("{}_is_signer", v))
+}
+
+/// A call resolved from the AST: the callee's final path segment, plus the token
+/// text of the values the callee is applied to (receiver included for method
+/// calls, raw tokens for macros).
+struct CallSite {
+    name: String,
+    args: String,
+}
+
+/// Collects real call sites — plain calls, method calls and macro invocations —
+/// from a block. Callee names come from AST identifiers, so `validate_signer`
+/// and `validate_signer_seeds` are distinct callees, and a word inside a string
+/// literal is never a callee.
+struct CallSiteCollector {
+    sites: Vec<CallSite>,
+}
+
+impl<'ast> Visit<'ast> for CallSiteCollector {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(syn::ExprPath { path, .. }) = node.func.as_ref() {
+            if let Some(seg) = path.segments.last() {
+                self.sites.push(CallSite {
+                    name: seg.ident.to_string(),
+                    args: node
+                        .args
+                        .iter()
+                        .map(|a| a.to_token_stream().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" , "),
+                });
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // The receiver is the value the assertion is applied to for the
+        // `authority.assert_signer()?` shape, so it counts as an argument.
+        let mut args = node.receiver.to_token_stream().to_string();
+        for a in &node.args {
+            args.push_str(" , ");
+            args.push_str(&a.to_token_stream().to_string());
+        }
+        self.sites.push(CallSite {
+            name: node.method.to_string(),
+            args,
+        });
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if let Some(seg) = node.path.segments.last() {
+            self.sites.push(CallSite {
+                name: seg.ident.to_string(),
+                args: node.tokens.to_string(),
+            });
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Returns true if `block` calls a signer-assertion helper (Metaplex
+/// `mpl_utils::assert_signer` and friends, whose body is
+/// `if !info.is_signer { return Err(MissingRequiredSignature) }`, so that `?`
+/// aborts before any mutation).
+///
+/// Three structural requirements replace the old substring test:
+///   1. the helper must appear as an actual *call site* resolved from the AST,
+///      matching a helper form under its exact identifier (see
+///      `is_signer_assert_helper_name`);
+///   2. if the helper is defined in this file, the call graph's resolved body
+///      decides — a local helper that never reads signer status does not
+///      suppress, however suggestively it is named. Only helpers whose body we
+///      cannot see (external crates) are trusted on the name alone;
+///   3. the assertion must be applied to one of `risky_params` — the very
+///      accounts we would otherwise flag — so asserting on some unrelated value
+///      does not clear an account that was never checked. Pass `None` to skip
+///      this when there is no specific account at stake.
+fn calls_signer_assert_helper(
+    block: &syn::Block,
+    graph: &call_graph::CallGraph,
+    risky_params: Option<&[String]>,
+) -> bool {
+    let mut collector = CallSiteCollector { sites: Vec::new() };
+    collector.visit_block(block);
+
+    for site in &collector.sites {
+        if !is_signer_assert_helper_name(&site.name) {
+            continue;
+        }
+        // (2) A same-file definition overrides its own name.
+        if let Some(info) = graph.get(&site.name) {
+            if !info.has_signer_check {
+                continue;
+            }
+        }
+        // (3) The assertion must land on an account we would otherwise flag.
+        match risky_params {
+            Some(params) if !params.iter().any(|p| args_mention(&site.args, p)) => continue,
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Returns true if the token text `args` mentions `param` as a whole identifier,
+/// so `escrow` does not match `escrow_wallet` (or vice versa). Token-stream text
+/// is space-separated, but `&authority` / `authority.key` shapes mean the
+/// boundary still has to be checked against the neighbouring characters.
+fn args_mention(args: &str, param: &str) -> bool {
+    if param.is_empty() {
+        return false;
+    }
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
+    for (idx, _) in args.match_indices(param) {
+        let before_ok = args[..idx]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !is_ident_char(c));
+        let after_ok = args[idx + param.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !is_ident_char(c));
+        if before_ok && after_ok {
             return true;
         }
     }
@@ -360,9 +576,14 @@ fn callee_checks_signer(graph: &call_graph::CallGraph, fn_name: &str) -> bool {
 /// `target_fn` — the SPL `impl Processor { fn process(..) { check; dispatch(..) } }`
 /// idiom, semantically identical to the free-function caller-validates pattern
 /// the detector already accepts.
-fn impl_method_caller_checks_signer(ast: &syn::File, target_fn: &str) -> bool {
+fn impl_method_caller_checks_signer(
+    ast: &syn::File,
+    graph: &call_graph::CallGraph,
+    target_fn: &str,
+) -> bool {
     struct Finder<'a> {
         target_fn: &'a str,
+        graph: &'a call_graph::CallGraph,
         found: bool,
     }
     impl<'ast, 'a> Visit<'ast> for Finder<'a> {
@@ -370,12 +591,11 @@ fn impl_method_caller_checks_signer(ast: &syn::File, target_fn: &str) -> bool {
             if self.found {
                 return;
             }
-            let body = m.block.to_token_stream().to_string();
-            let clean = strip_string_literals(&body);
-            let has_check = clean.contains("is_signer")
-                || clean.contains("has_signer")
-                || clean.contains("signer_key")
-                || body_calls_signer_assert_helper(&clean);
+            // Resolved the same structural way as the primary guard. No specific
+            // account is at stake here — the question is only whether this
+            // dispatcher checks a signer at all — so no param binding is applied.
+            let has_check = body_touches_signer_property(&m.block)
+                || calls_signer_assert_helper(&m.block, self.graph, None);
             if has_check {
                 let mut collector = CallNameCollector { names: Vec::new() };
                 collector.visit_block(&m.block);
@@ -390,6 +610,7 @@ fn impl_method_caller_checks_signer(ast: &syn::File, target_fn: &str) -> bool {
 
     let mut finder = Finder {
         target_fn,
+        graph,
         found: false,
     };
     finder.visit_file(ast);
@@ -671,6 +892,115 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag when an impl-block caller checks signer before dispatch"
+        );
+    }
+
+    // ---- MUST-STILL-FLAG regression tests ----
+    // These pin recall. A future FP-reduction pass that trips one of them has
+    // silenced a real vulnerability, not removed a false positive.
+
+    // A helper named `validate_signer_seeds` validates PDA seeds and performs no
+    // signer verification at all, but the ADV-206 guard substring-matched it
+    // against `validate_signer` and suppressed the finding. `authority` is never
+    // checked for is_signer, so any caller can name an arbitrary non-signing
+    // authority and drain the escrow's lamports.
+    #[test]
+    fn test_still_flags_signer_named_helper_that_only_checks_seeds() {
+        let source = r#"
+            pub fn withdraw_all(authority: &AccountInfo, escrow: &AccountInfo, program_id: &Pubkey, bump: u8, amount: u64) -> ProgramResult {
+                validate_signer_seeds(escrow, program_id, bump)?;
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                **authority.try_borrow_mut_lamports()? += amount;
+                Ok(())
+            }
+
+            fn validate_signer_seeds(escrow: &AccountInfo, program_id: &Pubkey, bump: u8) -> ProgramResult {
+                let expected = Pubkey::create_program_address(&[b"escrow", &[bump]], program_id)
+                    .map_err(|_| ProgramError::InvalidSeeds)?;
+                if expected != *escrow.key {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Must flag: `validate_signer_seeds` checks PDA seeds, not is_signer"
+        );
+        assert_eq!(findings[0].detector_id, "SOL-001");
+    }
+
+    // Control for the test above: byte-identical vulnerability with the helper
+    // renamed `validate_pda_seeds`. Same code, same vuln, evasion removed — both
+    // must flag, and the pair proves the verdict no longer turns on the name.
+    #[test]
+    fn test_still_flags_pda_seeds_helper_control() {
+        let source = r#"
+            pub fn withdraw_all(authority: &AccountInfo, escrow: &AccountInfo, program_id: &Pubkey, bump: u8, amount: u64) -> ProgramResult {
+                validate_pda_seeds(escrow, program_id, bump)?;
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                **authority.try_borrow_mut_lamports()? += amount;
+                Ok(())
+            }
+
+            fn validate_pda_seeds(escrow: &AccountInfo, program_id: &Pubkey, bump: u8) -> ProgramResult {
+                let expected = Pubkey::create_program_address(&[b"escrow", &[bump]], program_id)
+                    .map_err(|_| ProgramError::InvalidSeeds)?;
+                if expected != *escrow.key {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Must flag: control for the validate_signer_seeds probe"
+        );
+    }
+
+    // A local helper whose name matches a real assertion form exactly, but whose
+    // resolved body only checks seeds. The name must not beat the body.
+    #[test]
+    fn test_still_flags_local_assert_signer_helper_that_checks_nothing() {
+        let source = r#"
+            pub fn withdraw_all(authority: &AccountInfo, escrow: &AccountInfo, amount: u64) -> ProgramResult {
+                assert_signer(escrow)?;
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                **authority.try_borrow_mut_lamports()? += amount;
+                Ok(())
+            }
+
+            fn assert_signer(escrow: &AccountInfo) -> ProgramResult {
+                if *escrow.key == Pubkey::default() {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Must flag: local assert_signer resolves to a body that never reads is_signer"
+        );
+    }
+
+    // The word `is_signer` appearing only inside a log string is not a check.
+    #[test]
+    fn test_still_flags_is_signer_only_in_string_literal() {
+        let source = r#"
+            pub fn withdraw_all(authority: &AccountInfo, escrow: &AccountInfo, amount: u64) -> ProgramResult {
+                msg!("skipping is_signer verification for speed");
+                **escrow.try_borrow_mut_lamports()? -= amount;
+                **authority.try_borrow_mut_lamports()? += amount;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Must flag: `is_signer` inside a msg! literal performs no verification"
         );
     }
 

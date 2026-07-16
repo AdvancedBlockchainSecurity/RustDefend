@@ -59,15 +59,119 @@ struct OverflowVisitor<'a> {
     in_function: bool,
 }
 
+/// A `cfg(...)` predicate, modelled structurally. Atoms other than a bare
+/// `test` (`feature = "x"`, `target_os = "wasm32"`, ...) are not interpreted:
+/// they are `Unknown` and may take either value.
+enum CfgPred {
+    /// The bare `test` atom, i.e. the flag rustc sets only for test builds.
+    Test,
+    /// Any atom we do not model; free to be either true or false.
+    Unknown,
+    Not(Box<CfgPred>),
+    All(Vec<CfgPred>),
+    Any(Vec<CfgPred>),
+}
+
+/// Lowers a `cfg` predicate's `Meta` into a `CfgPred` tree.
+fn parse_cfg_pred(meta: &syn::Meta) -> CfgPred {
+    match meta {
+        syn::Meta::Path(path) => {
+            if path.is_ident("test") {
+                CfgPred::Test
+            } else {
+                CfgPred::Unknown
+            }
+        }
+        syn::Meta::List(list) => {
+            let nested = match list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) {
+                Ok(nested) => nested,
+                // Unparsable predicate: assume nothing about it.
+                Err(_) => return CfgPred::Unknown,
+            };
+            let mut children: Vec<CfgPred> = nested.iter().map(parse_cfg_pred).collect();
+            if list.path.is_ident("not") {
+                // `not` takes exactly one predicate.
+                match children.pop() {
+                    Some(child) if children.is_empty() => CfgPred::Not(Box::new(child)),
+                    _ => CfgPred::Unknown,
+                }
+            } else if list.path.is_ident("all") {
+                CfgPred::All(children)
+            } else if list.path.is_ident("any") {
+                CfgPred::Any(children)
+            } else {
+                // e.g. `feature("x")` style atoms we do not model.
+                CfgPred::Unknown
+            }
+        }
+        // `feature = "x"`, `target_os = "linux"`, ...
+        syn::Meta::NameValue(_) => CfgPred::Unknown,
+    }
+}
+
+/// Can this predicate hold in a build where `test` is NOT set (i.e. the
+/// release WASM build)? Unknown atoms are free, so this asks whether *some*
+/// non-test configuration compiles the item in.
+fn can_hold_without_test(pred: &CfgPred) -> bool {
+    match pred {
+        CfgPred::Test => false,
+        CfgPred::Unknown => true,
+        CfgPred::Not(inner) => can_fail_without_test(inner),
+        CfgPred::All(children) => children.iter().all(can_hold_without_test),
+        CfgPred::Any(children) => children.iter().any(can_hold_without_test),
+    }
+}
+
+/// Dual of `can_hold_without_test`: can this predicate be false in a build
+/// where `test` is not set? Needed to push negations through `not(...)`.
+fn can_fail_without_test(pred: &CfgPred) -> bool {
+    match pred {
+        CfgPred::Test => true,
+        CfgPred::Unknown => true,
+        CfgPred::Not(inner) => can_hold_without_test(inner),
+        CfgPred::All(children) => children.iter().any(can_fail_without_test),
+        CfgPred::Any(children) => children.iter().all(can_fail_without_test),
+    }
+}
+
 /// Returns true if the attributes mark this item as test-only code, i.e.
 /// `#[cfg(test)]`, `#[test]`, or a framework test attribute
 /// (`#[tokio::test]`, `#[ink::test]`, `#[near_sdk::test]`, ...). Such code is
 /// excluded from the release WASM build and never executes on-chain, so
 /// intentional overflow edge-case exercises there are not deployable
 /// vulnerabilities.
+///
+/// The `cfg` predicate is *evaluated* rather than string-matched: an item is
+/// test-only only when no non-test configuration can compile it in. A raw
+/// `contains("test")` check would misread `#[cfg(not(test))]` -- production-
+/// only code, the exact opposite -- as test-only and silently drop real
+/// findings on the deployed path.
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {
-    // #[cfg(test)] on a module or fn.
-    if has_nested_attribute(attrs, "cfg", "test") {
+    // Multiple `#[cfg(..)]` attributes on one item are ANDed, so any single
+    // predicate that excludes every non-test build makes the item test-only.
+    let cfg_test_only = attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let list = match &attr.meta {
+            syn::Meta::List(list) => list,
+            _ => return false,
+        };
+        let nested = match list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) {
+            Ok(nested) => nested,
+            Err(_) => return false,
+        };
+        // `cfg` takes exactly one predicate.
+        match nested.first() {
+            Some(meta) if nested.len() == 1 => !can_hold_without_test(&parse_cfg_pred(meta)),
+            _ => false,
+        }
+    });
+    if cfg_test_only {
         return true;
     }
     attrs.iter().any(|attr| {
@@ -234,6 +338,99 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag wrapping_add inside a #[test] fn"
+        );
+    }
+
+    #[test]
+    fn test_still_flags_cfg_not_test_production_fn() {
+        // REGRESSION (false negative): `#[cfg(not(test))]` marks code that
+        // ships in the release WASM and is compiled OUT of test builds -- the
+        // exact opposite of test-only. A substring `contains("test")` check on
+        // the stringified cfg attribute silenced this genuinely vulnerable
+        // on-chain debit path. Must always be flagged.
+        let source = r#"
+            use near_sdk::{env, near_bindgen, AccountId, Balance};
+
+            #[cfg(not(test))]
+            fn debit_stake(pool: &mut StakingPool, account: &AccountId, amount: Balance) -> Balance {
+                let current = pool.staked.get(account).unwrap_or(0);
+                let remaining = current.wrapping_sub(amount);
+                pool.staked.insert(account, &remaining);
+                pool.total_staked = pool.total_staked.wrapping_sub(amount);
+                remaining
+            }
+
+            #[cfg(test)]
+            fn debit_stake(pool: &mut StakingPool, account: &AccountId, amount: Balance) -> Balance {
+                let current = pool.staked.get(account).unwrap_or(0);
+                let remaining = current.checked_sub(amount).expect("insufficient stake");
+                pool.staked.insert(account, &remaining);
+                pool.total_staked = pool.total_staked.checked_sub(amount).expect("underflow");
+                remaining
+            }
+        "#;
+        let findings = run_detector(source);
+        assert_eq!(
+            findings.len(),
+            2,
+            "Should flag both wrapping_sub calls in the #[cfg(not(test))] production fn, got {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn test_still_flags_cfg_any_test_or_feature() {
+        // `any(test, feature = "x")` still compiles in a non-test build when
+        // the feature is enabled, so it is not test-only.
+        let source = r#"
+            use near_sdk::env;
+
+            #[cfg(any(test, feature = "simulation"))]
+            fn debit(balance: u128, amount: u128) -> u128 {
+                balance.wrapping_sub(amount)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag wrapping_sub under #[cfg(any(test, feature = ...))]"
+        );
+    }
+
+    #[test]
+    fn test_no_finding_cfg_all_test_and_feature() {
+        // `all(test, feature = "x")` cannot hold in any non-test build, so it
+        // is test-only and must stay silent.
+        let source = r#"
+            use near_sdk::env;
+
+            #[cfg(all(test, feature = "simulation"))]
+            fn balance_wraps(balance: u128, amount: u128) -> u128 {
+                balance.wrapping_sub(amount)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag wrapping_sub under #[cfg(all(test, feature = ...))]"
+        );
+    }
+
+    #[test]
+    fn test_still_flags_cfg_feature_gated_fn() {
+        // A plain feature gate is not a test gate.
+        let source = r#"
+            use near_sdk::env;
+
+            #[cfg(not(feature = "stub"))]
+            fn debit(balance: u128, amount: u128) -> u128 {
+                balance.wrapping_sub(amount)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag wrapping_sub under a non-test feature gate"
         );
     }
 }

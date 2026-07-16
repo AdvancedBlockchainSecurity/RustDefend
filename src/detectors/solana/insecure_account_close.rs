@@ -1,3 +1,4 @@
+use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::Visit;
 use syn::{Attribute, ItemFn, ItemMod};
@@ -75,6 +76,74 @@ fn is_test_attributed(attrs: &[Attribute]) -> bool {
     })
 }
 
+/// True if `tokens` bind Anchor's `close` constraint, i.e. the bare identifier
+/// `close` immediately followed by a lone `=` token. Recurses into delimited
+/// groups so `#[account(mut, close = destination)]` matches.
+///
+/// This walks the token tree rather than the rendered string: an occurrence of
+/// `close` inside a string literal (including the `#[doc = "..."]` attributes
+/// that `///` comments desugar to) is a single Literal token and can never be
+/// mistaken for the `close` identifier. `close == x` is excluded by rejecting a
+/// `=` that is itself followed by `=`, so an equality constraint is not read as
+/// a binding.
+fn tokens_bind_anchor_close(tokens: TokenStream) -> bool {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, tt) in trees.iter().enumerate() {
+        match tt {
+            TokenTree::Group(group) => {
+                if tokens_bind_anchor_close(group.stream()) {
+                    return true;
+                }
+            }
+            TokenTree::Ident(ident) if ident == "close" => {
+                let is_assign = matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '=')
+                    && !matches!(trees.get(i + 2), Some(TokenTree::Punct(p)) if p.as_char() == '=');
+                if is_assign {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True if `attr` is a real Anchor `#[account(..., close = target, ...)]`
+/// constraint.
+///
+/// The attribute *path* must actually be `account` and the `close = ..` binding
+/// must appear as tokens inside it. Prose that merely mentions the constraint —
+/// e.g. a doc comment reading ``use `#[account(close = destination)]`
+/// instead`` — parses as `#[doc = "..."]`, whose path is `doc` and whose body is
+/// one opaque string literal, so it is rejected on both counts.
+fn is_anchor_close_attr(attr: &Attribute) -> bool {
+    if !attr.path().is_ident("account") {
+        return false;
+    }
+    tokens_bind_anchor_close(attr.meta.to_token_stream())
+}
+
+/// True if an Anchor `close` constraint is declared anywhere within `func` —
+/// on the function itself or on any nested item/field (e.g. an inline
+/// `#[derive(Accounts)]` struct). When Anchor owns the closure, the manual
+/// lamport bookkeeping in the body is not the closing operation.
+fn declares_anchor_close(func: &ItemFn) -> bool {
+    struct AnchorCloseFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for AnchorCloseFinder {
+        fn visit_attribute(&mut self, attr: &'ast Attribute) {
+            if is_anchor_close_attr(attr) {
+                self.found = true;
+            }
+        }
+    }
+
+    let mut finder = AnchorCloseFinder { found: false };
+    finder.visit_item_fn(func);
+    finder.found
+}
+
 /// True if the token-stream body contains a genuine zero-assignment to a
 /// lamport balance (e.g. `**acc.lamports.borrow_mut() = 0` or
 /// `**acc.try_borrow_mut_lamports()? = 0`).
@@ -134,10 +203,10 @@ impl<'ast, 'a> Visit<'ast> for CloseVisitor<'a> {
             return;
         }
 
-        let fn_src = func.to_token_stream().to_string();
-
-        // Skip Anchor close = recipient pattern
-        if fn_src.contains("close =") || fn_src.contains("close=") {
+        // Skip the Anchor `close = recipient` pattern, but only when the
+        // constraint is really declared as an `#[account(..)]` attribute — not
+        // merely named in a doc comment or a string.
+        if declares_anchor_close(func) {
             return;
         }
 
@@ -383,6 +452,100 @@ mod tests {
         assert!(
             findings.is_empty(),
             "copy_from_slice zeroing of account data must be recognized as a mitigation"
+        );
+    }
+
+    // MUST STILL FLAG: a genuinely vulnerable manual close whose doc comment
+    // merely *mentions* Anchor's `#[account(close = destination)]`. The prose
+    // desugars to a `#[doc = "..."]` attribute, so a substring scan over the
+    // function's token stream sees `close =` and wrongly silences the detector.
+    // The account here is never zeroed, reassigned, or realloc'd -> revival
+    // attack. Documentation must never suppress a finding.
+    #[test]
+    fn test_still_flags_close_with_anchor_mention_in_doc_comment() {
+        let source = r#"
+            use solana_program::account_info::AccountInfo;
+            use solana_program::entrypoint::ProgramResult;
+            use solana_program::program_error::ProgramError;
+            use solana_program::pubkey::Pubkey;
+
+            /// Closes a staking position and refunds the rent to `destination`.
+            ///
+            /// Historical note: this manual helper predates our Anchor migration. New
+            /// instructions should use the Anchor attribute `#[account(close = destination)]`
+            /// instead of calling this directly.
+            pub fn close_stake_position(
+                position: &AccountInfo,
+                destination: &AccountInfo,
+                authority: &AccountInfo,
+                program_id: &Pubkey,
+            ) -> ProgramResult {
+                if !authority.is_signer {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+                if position.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                let refund = position.lamports();
+                **destination.try_borrow_mut_lamports()? += refund;
+                **position.try_borrow_mut_lamports()? = 0;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Doc-comment prose mentioning `close = destination` must not suppress \
+             a real insecure close"
+        );
+    }
+
+    // MUST STILL FLAG: same vulnerability, `close = ..` named in a string
+    // literal in the body rather than a doc comment.
+    #[test]
+    fn test_still_flags_close_with_anchor_mention_in_string_literal() {
+        let source = r#"
+            use solana_program::account_info::AccountInfo;
+            use solana_program::entrypoint::ProgramResult;
+
+            pub fn close_position(position: &AccountInfo, destination: &AccountInfo) -> ProgramResult {
+                msg!("deprecated: migrate to #[account(close = destination)]");
+                **destination.try_borrow_mut_lamports()? += position.lamports();
+                **position.try_borrow_mut_lamports()? = 0;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A `close = ..` mention inside a string literal must not suppress a real \
+             insecure close"
+        );
+    }
+
+    // Guard boundary: a real `#[account(close = ..)]` constraint still suppresses.
+    #[test]
+    fn test_no_finding_real_anchor_close_constraint() {
+        let source = r#"
+            use anchor_lang::prelude::*;
+
+            pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+                #[derive(Accounts)]
+                pub struct ClosePosition<'info> {
+                    #[account(mut, close = destination)]
+                    pub position: Account<'info, Position>,
+                    #[account(mut)]
+                    pub destination: SystemAccount<'info>,
+                }
+                **ctx.accounts.position.to_account_info().try_borrow_mut_lamports()? = 0;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "A genuine #[account(close = ..)] constraint must still suppress the finding"
         );
     }
 

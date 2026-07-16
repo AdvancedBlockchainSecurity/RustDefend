@@ -163,7 +163,7 @@ impl<'ast, 'a> Visit<'ast> for CallerVisitor<'a> {
         }
 
         // Check for caller verification in the method's own body.
-        let mut has_caller_check = body_contains_caller_check(&body_src);
+        let mut has_caller_check = body_performs_caller_check(&body_src);
 
         // FP idx 0: access control delegated to a private guard helper such as
         // `self.ensure_admin()?` or `if !self.is_admin() { ... }`. Resolve the
@@ -276,24 +276,257 @@ fn is_sensitive_field(field: &str) -> bool {
         || fl.contains("operator")
 }
 
-/// Returns the tokenized-source form of the recognized caller/access-control
-/// checks the detector treats as sufficient. Reused for both the message body
-/// and for resolved guard-helper bodies.
-fn body_contains_caller_check(body: &str) -> bool {
-    body.contains("caller")
-        || body.contains("ensure !")
-        || body.contains("ensure!")
-        || body.contains("assert !")
-        || body.contains("assert!")
-        || body.contains("only_owner")
-        || body.contains("authorize")
-        || (body.contains("owner") && (body.contains("== ") || body.contains("!= ")))
-        || (body.contains("admin") && (body.contains("== ") || body.contains("!= ")))
+/// Unambiguous access-control primitives. *Invoking* one of these is itself the
+/// caller check (OpenBrush's `only_owner()`, `access_control(...)`, ...), so a
+/// call site is accepted without resolving a body. Only names whose sole
+/// meaning is access control belong here — generic verbs (`validate`, `check`,
+/// `ensure`) do not, because they say nothing about what the callee does; those
+/// are resolved through `resolved_call_has_check` instead.
+const ACCESS_CONTROL_FNS: [&str; 9] = [
+    "only_owner",
+    "only_admin",
+    "only_role",
+    "only_owner_or",
+    "only_role_or",
+    "access_control",
+    "authorize",
+    "require_auth",
+    "ensure_owner",
+];
+
+/// Macros whose argument is a condition that aborts/reverts when it does not
+/// hold. A caller comparison appearing here is a real gate.
+const CHECK_MACROS: [&str; 7] = [
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "ensure",
+    "require",
+];
+
+/// True when `body` genuinely *performs* a caller check, i.e. the caller's
+/// identity is tested in a position that diverges when the test fails (an
+/// `assert!`/`ensure!`/`require!` condition or an `if` condition), or an
+/// unambiguous access-control primitive is actually invoked.
+///
+/// Deliberately structural rather than name/spelling based: a body that merely
+/// *contains* the token `assert!` performs no access control (a `validate_*`
+/// helper rejecting the zero address is the canonical example), and a body that
+/// merely mentions `owner` next to some unrelated `==` is not comparing the
+/// caller to it. Both previously silenced genuinely unguarded messages.
+fn body_performs_caller_check(body: &str) -> bool {
+    // Assertion messages ("caller is not owner") are prose, not checks.
+    let body = strip_string_literals(body);
+
+    if calls_access_control_primitive(&body) {
+        return true;
+    }
+
+    // Values that carry the caller's identity: `env().caller()` itself plus any
+    // local bound from it (`let who = self.env().caller();`).
+    let caller_values = caller_derived_values(&body);
+
+    let mut conditions = macro_conditions(&body);
+    conditions.extend(if_conditions(&body));
+    conditions.iter().any(|cond| {
+        caller_values
+            .iter()
+            .any(|value| contains_ident(cond, value))
+    })
+}
+
+/// Blanks out the contents of string literals so prose inside an assertion
+/// message is never mistaken for the checked expression. Also keeps the
+/// paren-matching below honest when a literal contains brackets.
+fn strip_string_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+                out.push('"');
+            }
+        } else if c == '"' {
+            in_str = true;
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// True when `s` contains `ident` as a whole token rather than as a substring of
+/// a longer identifier.
+fn contains_ident(s: &str, ident: &str) -> bool {
+    let mut start = 0;
+    while let Some(rel) = s[start..].find(ident) {
+        let i = start + rel;
+        let before_ok = s[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let after_ok = s[i + ident.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + ident.len();
+    }
+    false
+}
+
+/// True when `name` appears in `body` in call position (`name (`), as opposed to
+/// being merely mentioned.
+fn is_called(body: &str, name: &str) -> bool {
+    let mut start = 0;
+    while let Some(rel) = body[start..].find(name) {
+        let i = start + rel;
+        let before_ok = body[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if before_ok && body[i + name.len()..].trim_start().starts_with('(') {
+            return true;
+        }
+        start = i + name.len();
+    }
+    false
+}
+
+fn calls_access_control_primitive(body: &str) -> bool {
+    ACCESS_CONTROL_FNS.iter().any(|f| is_called(body, f))
+}
+
+/// Names holding a caller-derived value: `caller` itself, plus every local bound
+/// directly from an expression that reads the caller (`let who =
+/// self.env().caller();`). Comparing against one of these is a caller check.
+fn caller_derived_values(body: &str) -> Vec<String> {
+    let mut values = vec!["caller".to_string()];
+    let mut start = 0;
+    while let Some(rel) = body[start..].find("let ") {
+        let i = start + rel;
+        let before_ok = body[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let mut rest = body[i + "let ".len()..].trim_start();
+        if let Some(after_mut) = rest.strip_prefix("mut ") {
+            rest = after_mut.trim_start();
+        }
+        start = i + "let ".len();
+        if !before_ok {
+            continue;
+        }
+        let name_end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = &rest[..name_end];
+        // Initializer text, up to the end of the statement.
+        let init = &rest[name_end..];
+        let init = &init[..init.find(';').unwrap_or(init.len())];
+        if contains_ident(init, "caller") && !values.iter().any(|v| v == name) {
+            values.push(name.to_string());
+        }
+    }
+    values
+}
+
+/// Text of every `assert!`/`ensure!`/`require!`-style macro argument list.
+fn macro_conditions(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(rel) = body[start..].find('!') {
+        let i = start + rel;
+        start = i + 1;
+        // The tokenized form is `assert ! ( .. )`; recover the macro's name.
+        let head = body[..i].trim_end();
+        let name_start = head
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map_or(0, |p| p + 1);
+        let name = &head[name_start..];
+        if !CHECK_MACROS.contains(&name) {
+            continue;
+        }
+        if let Some(args) = balanced_parens(body[i + 1..].trim_start()) {
+            out.push(args);
+        }
+    }
+    out
+}
+
+/// Contents of a balanced `( .. )` group at the start of `s`.
+fn balanced_parens(s: &str) -> Option<&str> {
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[1..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Condition text of every `if` in the body — the span between `if` and the `{`
+/// opening its block (Rust forbids bare struct literals there, so the first `{`
+/// at bracket depth 0 is the block).
+fn if_conditions(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(rel) = body[start..].find("if ") {
+        let i = start + rel;
+        let before_ok = body[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let rest = &body[i + "if ".len()..];
+        start = i + "if ".len();
+        if !before_ok {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (idx, c) in rest.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '{' if depth == 0 => {
+                    out.push(&rest[..idx]);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Recursively determine whether a called same-file helper (or a helper it
 /// itself calls) performs a caller check. Bounded depth + visited set prevent
-/// cycles. Unresolvable names simply return false (never assumed safe).
+/// cycles. Unresolvable names simply return false (never assumed safe), and a
+/// resolved helper counts only if its body structurally checks the caller — a
+/// helper that validates its argument is not access control however it is named.
 fn resolved_call_has_check(
     bodies: &HashMap<String, String>,
     name: &str,
@@ -311,7 +544,7 @@ fn resolved_call_has_check(
         Some(b) => b,
         None => return false,
     };
-    if body_contains_caller_check(body) {
+    if body_performs_caller_check(body) {
         return true;
     }
     visited.push(name.to_string());
@@ -690,6 +923,99 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "A helper that performs no caller check must not suppress the finding"
+        );
+    }
+
+    // MUST STILL FLAG: a private helper named `validate_*` whose body asserts a
+    // non-zero address performs NO access control — anyone may seize ownership.
+    // Resolving the helper must not silence the unguarded `self.owner` write.
+    // Regression guard: the FP-idx-0 resolution used to bottom out in a
+    // substring predicate, so the mere token `assert!` in the helper body was
+    // taken for a caller check and this Critical went silent. Rewriting the very
+    // same assert as `if candidate == .. { panic!(..) }` — a change with zero
+    // security semantics — made it fire again, which is what proved the miss.
+    #[test]
+    fn test_still_flags_validate_helper_asserting_non_caller_value() {
+        let source = r#"
+            impl Vault {
+                fn validate_new_owner(&self, candidate: AccountId) {
+                    assert!(candidate != AccountId::from([0u8; 32]), "zero address");
+                }
+
+                #[ink(message)]
+                pub fn set_owner(&mut self, new_owner: AccountId) {
+                    self.validate_new_owner(new_owner);
+                    self.owner = new_owner;
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "A helper that only asserts its argument is non-zero performs no access \
+             control and must not silence the unguarded owner write"
+        );
+        assert_eq!(findings[0].severity, Severity::Critical);
+    }
+
+    // The same miss at the message's own call site: an assert! that checks an
+    // argument rather than the caller is not access control.
+    #[test]
+    fn test_still_flags_non_caller_assert_in_body() {
+        let source = r#"
+            impl Vault {
+                #[ink(message)]
+                pub fn set_admin(&mut self, new_admin: AccountId) {
+                    assert!(new_admin != AccountId::from([0u8; 32]), "zero address");
+                    self.admin = new_admin;
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "An assert! on an argument (not the caller) must not silence the finding"
+        );
+        assert_eq!(findings[0].severity, Severity::Critical);
+    }
+
+    // ...while an assert! that DOES compare the caller still suppresses, whether
+    // the caller is read inline or through a local binding.
+    #[test]
+    fn test_no_finding_caller_compared_via_local_binding() {
+        let source = r#"
+            impl Vault {
+                #[ink(message)]
+                pub fn set_admin(&mut self, new_admin: AccountId) {
+                    let who = self.env().caller();
+                    assert!(who == self.admin, "not admin");
+                    self.admin = new_admin;
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "A caller comparison through a local binding is a genuine caller check"
+        );
+    }
+
+    // An assertion *message* mentioning the caller is prose, not a check.
+    #[test]
+    fn test_still_flags_caller_only_in_assert_message() {
+        let source = r#"
+            impl Vault {
+                #[ink(message)]
+                pub fn set_owner(&mut self, new_owner: AccountId) {
+                    assert!(self.enabled, "caller must be the owner");
+                    self.owner = new_owner;
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "The word `caller` inside an assertion message performs no check"
         );
     }
 

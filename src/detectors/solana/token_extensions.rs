@@ -1,7 +1,10 @@
 use quote::ToTokens;
 use std::collections::HashMap;
 use syn::visit::Visit;
-use syn::{Attribute, Expr, ExprCall, ExprMethodCall, Fields, FnArg, ItemFn, ItemMod, ItemStruct};
+use syn::{
+    Attribute, Expr, ExprCall, ExprMethodCall, Fields, FnArg, ItemFn, ItemMod, ItemStruct, Macro,
+    PatIdent, Path,
+};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -122,22 +125,169 @@ const MOVEMENT_PATTERNS: &[&str] = &[
     "cpi",
 ];
 
-const SAFE_PATTERNS: &[&str] = &[
-    "get_extension_types",
+/// Token-2022 extension-introspection entry points. Counted only in *callee*
+/// position (or inside a macro argument, where `require!`/`assert!` guards live)
+/// — never because the word occurs somewhere in the body text.
+const EXTENSION_CHECK_CALLS: &[&str] = &["get_extension_types", "assert_mint_extensions"];
+
+/// Extension type/variant names from spl_token_2022. Code only ever writes these
+/// when it is naming the extension machinery itself, so a *path segment* naming
+/// one (exactly, or as a prefix — e.g. `TransferHookAccount`) is a genuine check
+/// signal. Matching segments rather than raw text keeps `TransferChecked` and
+/// `MintNotReady` from passing as `TransferHook` / `MintCloseAuthority`.
+const EXTENSION_TYPE_PATHS: &[&str] = &[
+    "ExtensionType",
     "PermanentDelegate",
     "TransferHook",
     "MintCloseAuthority",
-    "ExtensionType",
-    "ALLOWED_EXTENSION",
-    "assert_mint_extensions",
+];
+
+/// Project-local helpers that gate which mint is acceptable. Counted only when
+/// actually *called*: a local binding that merely happens to be spelled
+/// `valid_mint` is a computed value, not a check. Keying on the spelling alone
+/// is what silenced this detector on genuinely vulnerable escrow code.
+const ALLOWLIST_HELPER_CALLS: &[&str] = &[
     "valid_mint",
     "allowed_mint",
     "mint_whitelist",
     "mint_allowlist",
 ];
 
-fn source_has_safe_pattern(src: &str) -> bool {
-    SAFE_PATTERNS.iter().any(|p| src.contains(p))
+/// Module-level allowlist consts/statics. Counted only when read as a path that
+/// is not shadowed by a local binding of the same name.
+const ALLOWLIST_CONSTS: &[&str] = &["ALLOWED_EXTENSION", "MINT_WHITELIST", "MINT_ALLOWLIST"];
+
+/// Structural facts about a function, used to decide whether it really performs
+/// a Token-2022 extension check rather than merely spelling one of the check's
+/// vocabulary words somewhere in its body.
+#[derive(Default)]
+struct SafeCheckFacts {
+    /// Idents in callee position (`foo(..)` and `x.foo(..)`).
+    called: Vec<String>,
+    /// Every path segment appearing in expression, pattern or type position.
+    path_segments: Vec<String>,
+    /// Bare idents inside macro invocation tokens. syn does not parse macro
+    /// bodies, so `require!(!exts.contains(&ExtensionType::TransferHook), ..)`
+    /// would otherwise be invisible.
+    macro_idents: Vec<String>,
+    /// Idents introduced by `let` bindings or parameters — local values, never a
+    /// reference to a module-level allowlist const.
+    locals: Vec<String>,
+}
+
+impl SafeCheckFacts {
+    fn collect(func: &ItemFn) -> Self {
+        let mut facts = SafeCheckFacts::default();
+        facts.visit_item_fn(func);
+        facts
+    }
+
+    fn is_local(&self, ident: &str) -> bool {
+        self.locals.iter().any(|l| l == ident)
+    }
+
+    /// The extension API is invoked (call position, or named inside a guard macro).
+    fn calls_extension_api(&self) -> bool {
+        let in_calls = self
+            .called
+            .iter()
+            .any(|c| EXTENSION_CHECK_CALLS.contains(&c.as_str()));
+        let in_macros = self
+            .macro_idents
+            .iter()
+            .any(|i| EXTENSION_CHECK_CALLS.contains(&i.as_str()) && !self.is_local(i));
+        in_calls || in_macros
+    }
+
+    /// An extension type/variant is named in a real path (or guard-macro) position.
+    fn names_extension_type(&self) -> bool {
+        self.path_segments
+            .iter()
+            .chain(self.macro_idents.iter())
+            .any(|seg| EXTENSION_TYPE_PATHS.iter().any(|p| seg.starts_with(p)))
+    }
+
+    /// An allowlist helper is actually called on something.
+    fn calls_allowlist_helper(&self) -> bool {
+        let in_calls = self
+            .called
+            .iter()
+            .any(|c| ALLOWLIST_HELPER_CALLS.contains(&c.as_str()));
+        let in_macros = self
+            .macro_idents
+            .iter()
+            .any(|i| ALLOWLIST_HELPER_CALLS.contains(&i.as_str()) && !self.is_local(i));
+        in_calls || in_macros
+    }
+
+    /// An allowlist const/static is read (and is not a shadowing local binding).
+    fn reads_allowlist_const(&self) -> bool {
+        self.path_segments
+            .iter()
+            .chain(self.macro_idents.iter())
+            .any(|seg| {
+                !self.is_local(seg)
+                    && ALLOWLIST_CONSTS
+                        .iter()
+                        .any(|p| seg.to_uppercase().starts_with(p))
+            })
+    }
+}
+
+impl<'ast> Visit<'ast> for SafeCheckFacts {
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if let Expr::Path(p) = node.func.as_ref() {
+            if let Some(seg) = p.path.segments.last() {
+                self.called.push(seg.ident.to_string());
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.called.push(node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_path(&mut self, node: &'ast Path) {
+        for seg in &node.segments {
+            self.path_segments.push(seg.ident.to_string());
+        }
+        syn::visit::visit_path(self, node);
+    }
+
+    fn visit_pat_ident(&mut self, node: &'ast PatIdent) {
+        self.locals.push(node.ident.to_string());
+        syn::visit::visit_pat_ident(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        // Macro bodies are opaque token streams to syn; split them into bare
+        // idents so guard macros still count as structural check sites.
+        for piece in node
+            .tokens
+            .to_string()
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        {
+            if !piece.is_empty() {
+                self.macro_idents.push(piece.to_string());
+            }
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// True if `func` structurally performs a Token-2022 extension check: it invokes
+/// the extension-introspection API, names an extension type/variant in a real
+/// path position, calls an allowlist helper, or reads an allowlist const. A body
+/// that merely mentions the vocabulary (a local `let valid_mint = ..`, a comment,
+/// a string) does not qualify.
+fn performs_extension_check(func: &ItemFn) -> bool {
+    let facts = SafeCheckFacts::collect(func);
+    facts.calls_extension_api()
+        || facts.names_extension_type()
+        || facts.calls_allowlist_helper()
+        || facts.reads_allowlist_const()
 }
 
 /// True if the function is a test function. Covers `test_*` / `*_test` naming and
@@ -244,8 +394,10 @@ impl<'a> TokenExtVisitor<'a> {
     /// Resolve the local helpers this function calls (up to `depth` hops) and
     /// return true if any resolvable callee body performs the required extension
     /// check. This is a SOUND cross-function check: we only treat the code as
-    /// safe when we can read the callee's body and confirm the check tokens are
-    /// actually present — never a blanket name-based skip.
+    /// safe when we can read the callee's body and confirm it *structurally*
+    /// performs the check — never a blanket name-based skip, and never because
+    /// the callee happens to spell a vocabulary word (a helper that binds
+    /// `let valid_mint = mint.decimals == 6` checks decimals, not extensions).
     fn callee_has_safe_check(
         &self,
         func: &ItemFn,
@@ -261,8 +413,7 @@ impl<'a> TokenExtVisitor<'a> {
             }
             if let Some(callee) = self.fn_map.get(&name) {
                 visited.push(name.clone());
-                let src = callee.to_token_stream().to_string();
-                if source_has_safe_pattern(&src) {
+                if performs_extension_check(callee) {
                     return true;
                 }
                 if self.callee_has_safe_check(callee, depth - 1, visited) {
@@ -329,12 +480,10 @@ impl<'ast, 'a> Visit<'ast> for TokenExtVisitor<'a> {
             return;
         }
 
-        // Check for safe patterns in this function itself.
-        let has_safe = SAFE_PATTERNS
-            .iter()
-            .any(|p| body_src.contains(p) || fn_src.contains(p));
-
-        if has_safe {
+        // Check whether this function itself performs the extension check, by
+        // AST structure rather than by raw text: naming an extension type in a
+        // path, invoking the introspection API, or calling an allowlist helper.
+        if performs_extension_check(func) {
             return;
         }
 
@@ -500,6 +649,94 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag when a resolvable helper performs the extension check"
+        );
+    }
+
+    // MUST STILL FLAG (regression guard for ADV-206).
+    //
+    // `deposit` escrows an attacker-supplied Token-2022 mint via transfer_checked
+    // after delegating to a helper that only sanity-checks decimals and supply.
+    // The helper binds its result to a local named `valid_mint` — a word from the
+    // old safe-pattern vocabulary — but names nothing from the Token-2022
+    // extension API and calls no allowlist helper, so it cannot reject a mint
+    // carrying PermanentDelegate or TransferHook. Under raw substring matching
+    // that local silenced the detector on genuinely vulnerable code; renaming it
+    // to `decimals_ok` made the exact same vulnerability fire. The finding must
+    // not depend on what a local variable is spelled.
+    #[test]
+    fn test_still_flags_helper_that_only_spells_valid_mint() {
+        let source = r#"
+            fn ensure_mint_ready(mint: &InterfaceAccount<Mint>) -> Result<()> {
+                let valid_mint = mint.decimals == 6 && mint.supply > 0;
+                if !valid_mint {
+                    return Err(EscrowError::MintNotReady.into());
+                }
+                Ok(())
+            }
+
+            pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+                ensure_mint_ready(&ctx.accounts.mint)?;
+                let cpi_ctx = CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    TransferChecked {
+                        from: ctx.accounts.depositor_ata.to_account_info(),
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: ctx.accounts.vault.to_account_info(),
+                        authority: ctx.accounts.depositor.to_account_info(),
+                    },
+                );
+                token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.mint.decimals)?;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "SOL-012"),
+            "Must flag: helper only checks decimals/supply, a local named `valid_mint` is not an extension check"
+        );
+    }
+
+    // MUST STILL FLAG: the same vulnerability with the local renamed. This is the
+    // control for the test above — both spellings must produce the same finding.
+    #[test]
+    fn test_still_flags_helper_with_renamed_local() {
+        let source = r#"
+            fn ensure_mint_ready(mint: &InterfaceAccount<Mint>) -> Result<()> {
+                let decimals_ok = mint.decimals == 6 && mint.supply > 0;
+                if !decimals_ok {
+                    return Err(EscrowError::MintNotReady.into());
+                }
+                Ok(())
+            }
+
+            pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+                ensure_mint_ready(&ctx.accounts.mint)?;
+                token_interface::transfer_checked(cpi_ctx(&ctx), amount, ctx.accounts.mint.decimals)?;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "SOL-012"),
+            "Must flag: renaming a local must not change whether the vuln is reported"
+        );
+    }
+
+    // A `require!` guard naming an extension type is a real check even though syn
+    // does not parse macro bodies into paths.
+    #[test]
+    fn test_no_finding_extension_check_inside_require_macro() {
+        let source = r#"
+            pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+                let exts = get_extension_types(&ctx.accounts.mint.to_account_info().data.borrow())?;
+                require!(!exts.contains(&ExtensionType::TransferHook), ErrorCode::BadMint);
+                token_interface::transfer_checked(cpi_ctx(&ctx), amount, ctx.accounts.mint.decimals)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag when a require! guard rejects a dangerous extension"
         );
     }
 

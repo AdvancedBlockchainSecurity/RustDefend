@@ -1,7 +1,10 @@
 use quote::ToTokens;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use syn::visit::Visit;
-use syn::{Attribute, Expr, ExprCall, ExprLit, ImplItemFn, ItemFn, ItemMod, Lit};
+use syn::{
+    Attribute, Expr, ExprCall, ExprLit, ExprPath, ImplItemFn, ItemConst, ItemFn, ItemMod,
+    ItemStatic, Lit, LitStr,
+};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -33,10 +36,21 @@ impl Detector for StorageCollisionDetector {
     fn detect(&self, ctx: &ScanContext) -> Vec<Finding> {
         let mut findings = Vec::new();
 
-        // Collect all storage constructor calls with string prefixes
+        // First pass: index the module-level `const`/`static` items that own each
+        // prefix. A function-local constructor can only be an alias of a global
+        // storage item if such an item actually exists to be aliased.
+        let mut owner_visitor = ModuleOwnerVisitor {
+            owners: HashMap::new(),
+        };
+        owner_visitor.visit_file(&ctx.ast);
+
+        // Second pass: collect all storage constructor calls with string prefixes
         let mut prefix_locations: HashMap<String, Vec<usize>> = HashMap::new();
         let mut visitor = StorageVisitor {
             prefixes: &mut prefix_locations,
+            module_owners: &owner_visitor.owners,
+            fn_refs: HashSet::new(),
+            fn_seen: HashSet::new(),
             in_fn_body: false,
         };
         visitor.visit_file(&ctx.ast);
@@ -93,14 +107,152 @@ fn is_test_fn(attrs: &[Attribute]) -> bool {
     })
 }
 
+/// If `call` is a cw-storage-plus constructor (`Map::new`, `Item::new`, ...)
+/// whose first argument is a string literal, return that literal prefix.
+fn storage_prefix_lit(call: &ExprCall) -> Option<&LitStr> {
+    let func_str = call.func.to_token_stream().to_string();
+
+    // Match Map::new, Item::new, Deque::new etc.
+    if !((func_str.contains(":: new") || func_str.contains("::new"))
+        && (func_str.contains("Map")
+            || func_str.contains("Item")
+            || func_str.contains("Deque")
+            || func_str.contains("SnapshotMap")
+            || func_str.contains("SnapshotItem")))
+    {
+        return None;
+    }
+
+    // Extract the first string argument (prefix)
+    match call.args.first() {
+        Some(Expr::Lit(ExprLit {
+            lit: Lit::Str(s), ..
+        })) => Some(s),
+        _ => None,
+    }
+}
+
+/// Same as `storage_prefix_lit`, for an expression that is itself the
+/// constructor call (a `const`/`static` initializer).
+fn storage_prefix_of_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Call(call) => storage_prefix_lit(call).map(|s| s.value()),
+        _ => None,
+    }
+}
+
+/// First pass: maps each prefix to the module-level `const`/`static` items that
+/// declare it. Only these items are global storage declarations that a
+/// function-local constructor could legitimately be re-opening.
+struct ModuleOwnerVisitor {
+    owners: HashMap<String, Vec<String>>,
+}
+
+impl<'ast> Visit<'ast> for ModuleOwnerVisitor {
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        // Test-only code is compiled out of the deployed wasm; it owns nothing.
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+
+    // Function bodies cannot declare a global storage item, so nothing inside
+    // one can own a prefix.
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+    fn visit_impl_item_fn(&mut self, _node: &'ast ImplItemFn) {}
+
+    fn visit_item_const(&mut self, node: &'ast ItemConst) {
+        if let Some(prefix) = storage_prefix_of_expr(&node.expr) {
+            self.owners
+                .entry(prefix)
+                .or_default()
+                .push(node.ident.to_string());
+        }
+    }
+
+    fn visit_item_static(&mut self, node: &'ast ItemStatic) {
+        if let Some(prefix) = storage_prefix_of_expr(&node.expr) {
+            self.owners
+                .entry(prefix)
+                .or_default()
+                .push(node.ident.to_string());
+        }
+    }
+}
+
+/// Collects every identifier used as a value path in a subtree, so we can ask
+/// whether a function body actually works with a given module-level item.
+#[derive(Default)]
+struct PathIdentCollector {
+    idents: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for PathIdentCollector {
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        if let Some(seg) = node.path.segments.last() {
+            self.idents.insert(seg.ident.to_string());
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+}
+
+/// Identifiers referenced anywhere in `block`.
+fn referenced_idents(block: &syn::Block) -> HashSet<String> {
+    let mut c = PathIdentCollector::default();
+    c.visit_block(block);
+    c.idents
+}
+
 struct StorageVisitor<'a> {
     prefixes: &'a mut HashMap<String, Vec<usize>>,
+    /// Prefix -> module-level `const`/`static` items declaring it.
+    module_owners: &'a HashMap<String, Vec<String>>,
+    /// Identifiers referenced by the function body currently being walked.
+    fn_refs: HashSet<String>,
+    /// Prefixes already recorded for the body currently being walked: re-opening
+    /// one namespace several times in a single body is one declaration site.
+    fn_seen: HashSet<String>,
     /// Whether the visitor is currently walking inside a function/method body.
-    /// Only module-level const/static storage declarations represent distinct
-    /// global storage items; function-local re-declarations (e.g. the standard
-    /// cw-storage-plus migration idiom) are deliberate aliases of the same
-    /// namespace and must NOT be treated as collisions.
     in_fn_body: bool,
+}
+
+impl<'a> StorageVisitor<'a> {
+    /// Walk a function body with its own reference/alias bookkeeping.
+    fn in_fn<F: FnOnce(&mut Self)>(&mut self, block: &syn::Block, walk: F) {
+        let prev_in = self.in_fn_body;
+        let prev_refs = std::mem::replace(&mut self.fn_refs, referenced_idents(block));
+        let prev_seen = std::mem::take(&mut self.fn_seen);
+        self.in_fn_body = true;
+        walk(self);
+        self.in_fn_body = prev_in;
+        self.fn_refs = prev_refs;
+        self.fn_seen = prev_seen;
+    }
+
+    /// Whether this constructor site declares a storage item in its own right.
+    ///
+    /// A module-level declaration always does. A function-local one is a mere
+    /// alias only when the body *also works with* the module-level item that
+    /// owns the prefix -- that is what the cw-storage-plus migration idiom does:
+    /// it reads through the local legacy handle and writes through the global
+    /// one, so both names denote the same logical item. A body that opens a
+    /// namespace and never touches its owner is treating that namespace as an
+    /// item of its own, which is precisely how two logical items collide.
+    fn declares_item(&mut self, prefix: &str) -> bool {
+        if !self.in_fn_body {
+            return true;
+        }
+        let aliases_owner = self
+            .module_owners
+            .get(prefix)
+            .is_some_and(|owners| owners.iter().any(|o| self.fn_refs.contains(o)));
+        if aliases_owner {
+            return false;
+        }
+        // `insert` is false when this body already opened the same namespace.
+        self.fn_seen.insert(prefix.to_string())
+    }
 }
 
 impl<'ast, 'a> Visit<'ast> for StorageVisitor<'a> {
@@ -114,53 +266,26 @@ impl<'ast, 'a> Visit<'ast> for StorageVisitor<'a> {
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        // Skip test functions outright, and record declarations inside any
-        // function body as non-global (aliases, not distinct storage items).
+        // Skip test functions outright: they are compiled out of the wasm.
         if is_test_fn(&node.attrs) {
             return;
         }
-        let prev = self.in_fn_body;
-        self.in_fn_body = true;
-        syn::visit::visit_item_fn(self, node);
-        self.in_fn_body = prev;
+        self.in_fn(&node.block, |v| syn::visit::visit_item_fn(v, node));
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         if is_test_fn(&node.attrs) {
             return;
         }
-        let prev = self.in_fn_body;
-        self.in_fn_body = true;
-        syn::visit::visit_impl_item_fn(self, node);
-        self.in_fn_body = prev;
+        self.in_fn(&node.block, |v| syn::visit::visit_impl_item_fn(v, node));
     }
 
     fn visit_expr_call(&mut self, call: &'ast ExprCall) {
-        let func_str = call.func.to_token_stream().to_string();
-
-        // Match Map::new, Item::new, Deque::new etc.
-        if (func_str.contains(":: new") || func_str.contains("::new"))
-            && (func_str.contains("Map")
-                || func_str.contains("Item")
-                || func_str.contains("Deque")
-                || func_str.contains("SnapshotMap")
-                || func_str.contains("SnapshotItem"))
-        {
-            // Extract the first string argument (prefix)
-            if let Some(first_arg) = call.args.first() {
-                if let Expr::Lit(ExprLit {
-                    lit: Lit::Str(s), ..
-                }) = first_arg
-                {
-                    // Only module-level (const/static) declarations describe
-                    // distinct global storage items. Function-local ones are
-                    // deliberate aliases (migration idiom, test probes).
-                    if !self.in_fn_body {
-                        let prefix = s.value();
-                        let line = span_to_line(&s.span());
-                        self.prefixes.entry(prefix).or_default().push(line);
-                    }
-                }
+        if let Some(lit) = storage_prefix_lit(call) {
+            let prefix = lit.value();
+            if self.declares_item(&prefix) {
+                let line = span_to_line(&lit.span());
+                self.prefixes.entry(prefix).or_default().push(line);
             }
         }
 
@@ -229,6 +354,75 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Migration re-opening the same namespace must not be flagged"
+        );
+    }
+
+    // MUST STILL FLAG: two DISTINCT logical items (staked principal, reward
+    // points) accidentally share the "stakes" namespace, so a reward credit
+    // overwrites the caller's principal. The handlers open their maps lazily in
+    // the body instead of using module-level consts -- a placement difference
+    // only. ADV-206's `!in_fn_body` guard silenced this real High/High bug.
+    #[test]
+    fn test_still_flags_handler_local_colliding_maps() {
+        let source = r#"
+            pub fn execute_stake(deps: DepsMut, info: MessageInfo, amount: Uint128) -> StdResult<Response> {
+                let stakes: Map<&Addr, Uint128> = Map::new("stakes");
+                let current = stakes.may_load(deps.storage, &info.sender)?.unwrap_or_default();
+                stakes.save(deps.storage, &info.sender, &(current + amount))?;
+                Ok(Response::new())
+            }
+
+            pub fn execute_accrue_rewards(deps: DepsMut, user: String, amount: Uint128) -> StdResult<Response> {
+                let rewards: Map<&Addr, Uint128> = Map::new("stakes");
+                let addr = deps.api.addr_validate(&user)?;
+                let current = rewards.may_load(deps.storage, &addr)?.unwrap_or_default();
+                rewards.save(deps.storage, &addr, &(current + amount))?;
+                Ok(Response::new())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "CW-004"),
+            "Colliding prefix declared inside handler bodies must still be flagged"
+        );
+    }
+
+    // MUST STILL FLAG: the collision hides behind a module-level owner. The body
+    // opens "balances" for an unrelated item and never touches BALANCES, so this
+    // is a real collision and not the migration idiom.
+    #[test]
+    fn test_still_flags_local_shadowing_owner_it_never_uses() {
+        let source = r#"
+            pub const BALANCES: Map<&Addr, Uint128> = Map::new("balances");
+
+            pub fn record_vote(deps: DepsMut, info: MessageInfo, weight: Uint128) -> StdResult<Response> {
+                let votes: Map<&Addr, Uint128> = Map::new("balances");
+                votes.save(deps.storage, &info.sender, &weight)?;
+                Ok(Response::default())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.iter().any(|f| f.detector_id == "CW-004"),
+            "A body that re-opens a namespace without using its owner is a collision"
+        );
+    }
+
+    // A handler re-opening the same namespace repeatedly is one declaration
+    // site, not a self-collision.
+    #[test]
+    fn test_no_finding_same_body_reopens_one_namespace() {
+        let source = r#"
+            pub fn tally(deps: DepsMut, a: &Addr, b: &Addr) -> StdResult<Uint128> {
+                let left: Map<&Addr, Uint128> = Map::new("stakes");
+                let right: Map<&Addr, Uint128> = Map::new("stakes");
+                Ok(left.load(deps.storage, a)? + right.load(deps.storage, b)?)
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Re-opening one namespace within a single body is not a collision"
         );
     }
 

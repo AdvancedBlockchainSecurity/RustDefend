@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
 use proc_macro2::Span;
-use quote::ToTokens;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
     Attribute, BinOp, Expr, ExprBinary, ExprCall, ExprIf, ExprMacro, ExprMatch, ExprMethodCall,
-    ExprWhile, ImplItemFn, ItemFn, ItemMod, Macro, StmtMacro,
+    ExprWhile, ImplItemFn, ItemFn, ItemMod, Macro, Meta, StmtMacro,
 };
 
 use crate::detectors::Detector;
@@ -264,13 +263,60 @@ fn is_test_fn(attrs: &[Attribute]) -> bool {
     })
 }
 
-/// True if the attribute list contains `#[cfg(test)]`.
+/// True if a single `cfg` predicate can only ever hold in a test build — i.e.
+/// the code it gates is never compiled into the deployed contract.
+///
+/// This is evaluated over the parsed predicate tree, not over the spelling of
+/// the attribute: `#[cfg(not(test))]` gates code that is compiled *only* in
+/// non-test (deployment) builds, and `#[cfg(feature = "test-utils")]` names a
+/// feature that happens to contain "test". Both mention the token `test` while
+/// gating real on-chain code, so a substring match silences the detector on
+/// genuinely vulnerable bodies.
+fn cfg_pred_is_test_only(meta: &Meta) -> bool {
+    match meta {
+        // Bare `test` — the predicate itself.
+        Meta::Path(p) => p.is_ident("test"),
+        // `feature = "..."`, `target_os = "..."`, ... never imply a test build.
+        Meta::NameValue(_) => false,
+        Meta::List(list) => {
+            let inner =
+                match list.parse_args_with(Punctuated::<Meta, syn::Token![,]>::parse_terminated) {
+                    Ok(inner) => inner,
+                    // Unparsable predicate: assume it gates real code and keep scanning.
+                    Err(_) => return false,
+                };
+            if list.path.is_ident("all") {
+                // `all(test, ..)` holds only when `test` holds.
+                inner.iter().any(cfg_pred_is_test_only)
+            } else if list.path.is_ident("any") {
+                // `any(a, b)` is test-only only if every arm is test-only;
+                // `any(test, feature = "x")` still reaches deployment builds.
+                !inner.is_empty() && inner.iter().all(cfg_pred_is_test_only)
+            } else {
+                // `not(..)` is satisfiable in a non-test build (`not(test)` is
+                // exactly the deployment arm), as is any unknown predicate.
+                false
+            }
+        }
+    }
+}
+
+/// True if the attribute list gates the item to test builds only, e.g.
+/// `#[cfg(test)]` or `#[cfg(all(test, feature = "e2e"))]`.
+///
+/// Deliberately structural: `#[cfg(not(test))]` — the *deployment* arm of a
+/// test/non-test pair — must NOT be pruned.
 fn has_cfg_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
-        if a.path().is_ident("cfg") {
-            a.meta.to_token_stream().to_string().contains("test")
-        } else {
-            false
+        if !a.path().is_ident("cfg") {
+            return false;
+        }
+        match &a.meta {
+            Meta::List(list) => list
+                .parse_args_with(Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+                .map(|preds| preds.iter().any(cfg_pred_is_test_only))
+                .unwrap_or(false),
+            _ => false,
         }
     })
 }
@@ -417,6 +463,100 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag comment text or a store with a trailing comment, got: {:?}",
+            findings
+        );
+    }
+
+    // REGRESSION GUARD (false negative): `#[cfg(not(test))]` gates the *deployment*
+    // arm of a test/non-test pair — it is the code that actually ships on-chain.
+    // The old substring guard (`meta.to_string().contains("test")`) matched the
+    // "test" inside `not(test)` and pruned the body before it was ever walked,
+    // silencing a real timestamp gate. Must never regress: a scanner that misses
+    // a vuln is worse than one that over-reports.
+    #[test]
+    fn test_still_flags_cfg_not_test_deployment_arm() {
+        let source = r#"
+            #[ink::contract]
+            mod auction {
+                #[ink(storage)]
+                pub struct Auction { end_time: u64, settled: bool }
+
+                impl Auction {
+                    /// Real (on-chain) clock gate; a stub is compiled for tests.
+                    #[cfg(not(test))]
+                    fn auction_closed(&self) -> bool {
+                        self.env().block_timestamp() >= self.end_time
+                    }
+
+                    #[cfg(test)]
+                    fn auction_closed(&self) -> bool {
+                        self.settled
+                    }
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag the block_timestamp gate compiled into non-test builds \
+             (#[cfg(not(test))] is the deployment arm), got: {:?}",
+            findings
+        );
+    }
+
+    // A cfg'd fn is only skipped when the predicate can hold *only* in a test
+    // build. `any(test, feature = "x")` still reaches deployment builds.
+    #[test]
+    fn test_still_flags_cfg_any_test_or_feature() {
+        let source = r#"
+            #[ink(message)]
+            #[cfg(any(test, feature = "timelock"))]
+            pub fn is_expired(&self) -> bool {
+                self.env().block_timestamp() > self.deadline
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag a fn whose cfg is satisfiable without `test`, got: {:?}",
+            findings
+        );
+    }
+
+    // A feature whose *name* merely contains "test" does not make the code
+    // test-only; it is compiled on-chain whenever the feature is enabled.
+    #[test]
+    fn test_still_flags_cfg_feature_named_test() {
+        let source = r#"
+            #[ink(message)]
+            #[cfg(feature = "test-utils")]
+            pub fn is_expired(&self) -> bool {
+                self.env().block_timestamp() > self.deadline
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag a fn gated on a feature that merely spells 'test', got: {:?}",
+            findings
+        );
+    }
+
+    // Conversely, `all(test, ..)` genuinely cannot hold outside a test build,
+    // so it stays pruned (no FP re-introduced).
+    #[test]
+    fn test_no_finding_cfg_all_test_and_feature() {
+        let source = r#"
+            #[ink(message)]
+            #[cfg(all(test, feature = "e2e"))]
+            pub fn is_expired(&self) -> bool {
+                self.env().block_timestamp() > self.deadline
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            findings.is_empty(),
+            "Should not flag a fn that only compiles under `test`, got: {:?}",
             findings
         );
     }

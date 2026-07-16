@@ -1,7 +1,8 @@
 use quote::ToTokens;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{Expr, ImplItem, ImplItemFn, ItemImpl, ItemMod};
+use syn::{Expr, ImplItem, ImplItemFn, ItemImpl, ItemMod, Token};
 
 use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
@@ -107,15 +108,276 @@ fn expr_base_is_self(expr: &Expr) -> bool {
     }
 }
 
-/// Conventional bound / capacity vocabulary that indicates a length guard is present.
-/// These are *suppression* tokens only: matching one silences an otherwise-flagged
-/// method, so extending the list can never create a new finding.
-fn body_has_bound_vocab(body: &str) -> bool {
-    // Note: a syn token stream prints `.len()` as `len ()`, so match that form.
-    const TERMS: &[&str] = &[
-        "len ()", "MAX_", "max_", "LIMIT", "limit", "CAP", "capacity", "BOUND",
-    ];
-    TERMS.iter().any(|t| body.contains(t))
+/// Strip wrappers that do not change what an expression *is* for bound analysis:
+/// parens, groups, `&`/`&mut` borrows and `as` casts (`self.v.len() as u32 < MAX`).
+fn strip_expr(mut e: &Expr) -> &Expr {
+    loop {
+        e = match e {
+            Expr::Paren(p) => p.expr.as_ref(),
+            Expr::Group(g) => g.expr.as_ref(),
+            Expr::Reference(r) => r.expr.as_ref(),
+            Expr::Cast(c) => c.expr.as_ref(),
+            _ => return e,
+        };
+    }
+}
+
+/// True if `expr` reads contract state: an `Expr::Field` chain rooted at `self`
+/// (`self.items`, `self.inner.items`, `self.rows[i]`). Method-call hops are
+/// deliberately *not* traversed, so `self.env().block_timestamp()` is an
+/// environment query rather than a storage read and does not qualify.
+fn is_storage_field_read(expr: &Expr) -> bool {
+    let mut cur = strip_expr(expr);
+    let mut saw_field = false;
+    loop {
+        match cur {
+            Expr::Field(f) => {
+                saw_field = true;
+                cur = strip_expr(f.base.as_ref());
+            }
+            Expr::Index(i) => cur = strip_expr(i.expr.as_ref()),
+            Expr::Path(p) => {
+                return saw_field
+                    && p.path.segments.len() == 1
+                    && p.path.segments[0].ident == "self";
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// True if the expression subtree measures the length of a storage collection
+/// (`self.items.len()`). Callers only consult this on *operands of a comparison*,
+/// so a bare value computation such as `self.v.len().checked_sub(1)` in ordinary
+/// statement position never counts as a bound check.
+fn contains_storage_len_call(expr: &Expr) -> bool {
+    struct LenFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for LenFinder {
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if c.method == "len" && is_storage_field_read(c.receiver.as_ref()) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, c);
+        }
+    }
+    let mut f = LenFinder { found: false };
+    f.visit_expr(expr);
+    f.found
+}
+
+/// True if `expr` is a compile-time bound: an integer literal, a SCREAMING_SNAKE
+/// constant path (`MAX_ITEMS`, `Self::LIMIT`), or arithmetic over those.
+fn is_constant_bound(expr: &Expr) -> bool {
+    match strip_expr(expr) {
+        Expr::Lit(l) => matches!(l.lit, syn::Lit::Int(_)),
+        Expr::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| {
+                let n = s.ident.to_string();
+                n.chars().any(|c| c.is_ascii_uppercase())
+                    && !n.chars().any(|c| c.is_ascii_lowercase())
+            })
+            .unwrap_or(false),
+        Expr::Binary(b) => is_constant_bound(&b.left) && is_constant_bound(&b.right),
+        _ => false,
+    }
+}
+
+/// Comparison operators that can express a bound.
+fn is_comparison_op(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::Lt(_)
+            | syn::BinOp::Le(_)
+            | syn::BinOp::Gt(_)
+            | syn::BinOp::Ge(_)
+            | syn::BinOp::Eq(_)
+            | syn::BinOp::Ne(_)
+    )
+}
+
+/// Compound assignments (`+=`, `-=`, ...) — how a manual length counter is bumped.
+fn is_assign_op(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+    )
+}
+
+/// Assert/require families whose arguments are *conditions the code enforces*,
+/// as opposed to values it merely computes.
+fn is_assert_family(path: &syn::Path) -> bool {
+    path.segments
+        .last()
+        .map(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "assert"
+                    | "assert_eq"
+                    | "assert_ne"
+                    | "debug_assert"
+                    | "debug_assert_eq"
+                    | "debug_assert_ne"
+                    | "require"
+                    | "ensure"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Structural facts about one method body, gathered in a single AST pass.
+#[derive(Default)]
+struct BodyFacts {
+    /// Expressions the body actually enforces or branches on: assert!/require!
+    /// arguments and `if`/`while` conditions. A bound check must appear here —
+    /// merely *mentioning* a bound-ish token somewhere in the body is not enough.
+    guards: Vec<Expr>,
+    /// `let <name> = <expr>` bindings, so a guard written against a local
+    /// (`let n = self.items.len(); assert!(n < MAX)`) still resolves.
+    bindings: HashMap<String, Expr>,
+    /// Storage reads the body increments (`self.item_count += 1`), keyed by token
+    /// text. This is what makes a field a *counter* structurally, rather than by
+    /// its name.
+    counters: HashSet<String>,
+}
+
+struct FactCollector {
+    facts: BodyFacts,
+}
+
+impl<'ast> Visit<'ast> for FactCollector {
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        if let (syn::Pat::Ident(pi), Some(init)) = (&l.pat, &l.init) {
+            self.facts
+                .bindings
+                .insert(pi.ident.to_string(), (*init.expr).clone());
+        }
+        syn::visit::visit_local(self, l);
+    }
+
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        self.facts.guards.push((*i.cond).clone());
+        syn::visit::visit_expr_if(self, i);
+    }
+
+    fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        self.facts.guards.push((*w.cond).clone());
+        syn::visit::visit_expr_while(self, w);
+    }
+
+    fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+        if is_assign_op(&b.op) && is_storage_field_read(b.left.as_ref()) {
+            self.facts
+                .counters
+                .insert(b.left.to_token_stream().to_string());
+        }
+        syn::visit::visit_expr_binary(self, b);
+    }
+
+    fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        // `self.n = self.n + 1` is the same counter shape as `self.n += 1`.
+        if is_storage_field_read(a.left.as_ref()) {
+            self.facts
+                .counters
+                .insert(a.left.to_token_stream().to_string());
+        }
+        syn::visit::visit_expr_assign(self, a);
+    }
+
+    fn visit_expr_macro(&mut self, m: &'ast syn::ExprMacro) {
+        collect_macro_guards(&m.mac, &mut self.facts);
+        syn::visit::visit_expr_macro(self, m);
+    }
+
+    fn visit_stmt_macro(&mut self, s: &'ast syn::StmtMacro) {
+        // `assert!(..);` in statement position is a StmtMacro, not an ExprMacro.
+        collect_macro_guards(&s.mac, &mut self.facts);
+        syn::visit::visit_stmt_macro(self, s);
+    }
+}
+
+fn collect_macro_guards(mac: &syn::Macro, facts: &mut BodyFacts) {
+    if !is_assert_family(&mac.path) {
+        return;
+    }
+    if let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
+        facts.guards.extend(args);
+    }
+}
+
+fn collect_facts(block: &syn::Block) -> BodyFacts {
+    let mut c = FactCollector {
+        facts: BodyFacts::default(),
+    };
+    c.visit_block(block);
+    c.facts
+}
+
+/// Substitute a single-segment local through its `let` binding, one level deep.
+fn resolve_local<'e>(expr: &'e Expr, bindings: &'e HashMap<String, Expr>) -> &'e Expr {
+    let stripped = strip_expr(expr);
+    if let Expr::Path(p) = stripped {
+        if p.path.segments.len() == 1 {
+            if let Some(bound) = bindings.get(&p.path.segments[0].ident.to_string()) {
+                return strip_expr(bound);
+            }
+        }
+    }
+    stripped
+}
+
+/// `field` is a storage counter this body increments and `bound` is a constant.
+fn is_counter_vs_const(field: &Expr, bound: &Expr, counters: &HashSet<String>) -> bool {
+    is_storage_field_read(field)
+        && counters.contains(&field.to_token_stream().to_string())
+        && is_constant_bound(bound)
+}
+
+/// True if `expr` is a comparison that actually measures storage against a bound.
+/// Two accepted shapes, both requiring the measurement to be a *comparison
+/// operand* rather than a token appearing anywhere in the body:
+///   (a) `self.items.len()` on either side of the comparison, or
+///   (b) a storage counter the body increments compared against a constant
+///       (`assert!(self.item_count < ITEM_LIMIT)` alongside `self.item_count += 1`).
+fn is_bound_comparison(
+    expr: &Expr,
+    bindings: &HashMap<String, Expr>,
+    counters: &HashSet<String>,
+) -> bool {
+    match strip_expr(expr) {
+        Expr::Binary(b) if is_comparison_op(&b.op) => {
+            let l = resolve_local(b.left.as_ref(), bindings);
+            let r = resolve_local(b.right.as_ref(), bindings);
+            contains_storage_len_call(l)
+                || contains_storage_len_call(r)
+                || is_counter_vs_const(l, r, counters)
+                || is_counter_vs_const(r, l, counters)
+        }
+        // `a && b`, `a || b` — either conjunct may carry the bound.
+        Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
+            is_bound_comparison(&b.left, bindings, counters)
+                || is_bound_comparison(&b.right, bindings, counters)
+        }
+        Expr::Unary(u) => is_bound_comparison(&u.expr, bindings, counters),
+        _ => false,
+    }
+}
+
+/// True if any condition the body enforces is a real bound check.
+fn body_enforces_bound(facts: &BodyFacts, extra_counters: &HashSet<String>) -> bool {
+    let mut counters = facts.counters.clone();
+    counters.extend(extra_counters.iter().cloned());
+    facts
+        .guards
+        .iter()
+        .any(|g| is_bound_comparison(g, &facts.bindings, &counters))
 }
 
 impl<'a> StorageVisitor<'a> {
@@ -128,15 +390,21 @@ impl<'a> StorageVisitor<'a> {
     fn helper_enforces_bound(
         &self,
         body_calls: &[syn::ExprMethodCall],
-        siblings: &HashMap<String, String>,
+        siblings: &HashMap<String, &syn::Block>,
+        caller_counters: &HashSet<String>,
     ) -> bool {
         for call in body_calls {
             if !expr_base_is_self(call.receiver.as_ref()) {
                 continue;
             }
             let name = call.method.to_string();
-            if let Some(helper_body) = siblings.get(&name) {
-                if body_has_bound_vocab(helper_body) {
+            if let Some(helper_block) = siblings.get(&name) {
+                // The helper is analysed with the same structural rules as the
+                // caller. Counter increments may live on either side of the call
+                // (`self.n += 1` here, `assert!(self.n < MAX)` in the helper), so
+                // the caller's counters are visible to the helper's guards.
+                let facts = collect_facts(helper_block);
+                if body_enforces_bound(&facts, caller_counters) {
                     return true;
                 }
             }
@@ -144,7 +412,7 @@ impl<'a> StorageVisitor<'a> {
         false
     }
 
-    fn check_method(&mut self, method: &ImplItemFn, siblings: &HashMap<String, String>) {
+    fn check_method(&mut self, method: &ImplItemFn, siblings: &HashMap<String, &syn::Block>) {
         if is_test_fn(&method.attrs) {
             return;
         }
@@ -161,6 +429,9 @@ impl<'a> StorageVisitor<'a> {
         let mut collector = MethodCallCollector { calls: vec![] };
         collector.visit_block(&method.block);
 
+        // Structural facts (enforced conditions, let-bindings, counter fields).
+        let facts = collect_facts(&method.block);
+
         // ---- Vec push without bounds check ----
         let storage_push = collector
             .calls
@@ -168,8 +439,8 @@ impl<'a> StorageVisitor<'a> {
             .any(|c| c.method == "push" && expr_base_is_self(c.receiver.as_ref()));
 
         if storage_push && takes_mut_self(method) {
-            let bounded = body_has_bound_vocab(&body_src)
-                || self.helper_enforces_bound(&collector.calls, siblings);
+            let bounded = body_enforces_bound(&facts, &HashSet::new())
+                || self.helper_enforces_bound(&collector.calls, siblings, &facts.counters);
             if !bounded {
                 let line = span_to_line(&method.sig.ident.span());
                 self.findings.push(Finding {
@@ -200,8 +471,8 @@ impl<'a> StorageVisitor<'a> {
 
         if !storage_inserts.is_empty() {
             let has_bounds = body_src.contains("contains")
-                || body_has_bound_vocab(&body_src)
-                || self.helper_enforces_bound(&collector.calls, siblings);
+                || body_enforces_bound(&facts, &HashSet::new())
+                || self.helper_enforces_bound(&collector.calls, siblings, &facts.counters);
 
             // Skip well-known ERC-20/ERC-721 standard methods where Mapping
             // insertions are bounded by design (one entry per caller/owner).
@@ -264,13 +535,10 @@ impl<'ast, 'a> Visit<'ast> for StorageVisitor<'a> {
 
         // Build a map of every sibling method body in this impl so that guards
         // factored into helper functions can be resolved (one level deep).
-        let mut siblings: HashMap<String, String> = HashMap::new();
+        let mut siblings: HashMap<String, &syn::Block> = HashMap::new();
         for it in &item_impl.items {
             if let ImplItem::Fn(f) = it {
-                siblings.insert(
-                    f.sig.ident.to_string(),
-                    f.block.to_token_stream().to_string(),
-                );
+                siblings.insert(f.sig.ident.to_string(), &f.block);
             }
         }
 
@@ -436,6 +704,80 @@ mod tests {
         assert!(
             findings.is_empty(),
             "Should not flag when the bound check is in a called helper"
+        );
+    }
+
+    // ---- MUST-STILL-FLAG regression tests (real vulnerabilities) ----
+
+    // FN regression: the method enforces only a *time* window, but the local
+    // holding the deadline is named `time_limit`. The pre-fix vocabulary guard
+    // matched the substring "limit" anywhere in the body and silenced the
+    // detector, so an unbounded attacker-repeatable push went unreported.
+    // A bound check must be a comparison against a length/counter, not a name.
+    #[test]
+    fn test_still_flags_push_guarded_only_by_time_window() {
+        // Mirrors the audit probe verbatim, including the `#[ink::contract] mod`
+        // nesting and the `&self` `proposal_count` sibling that calls `.len()`.
+        let source = r#"
+            #[ink::contract]
+            mod governance {
+                #[ink(storage)]
+                pub struct Governance {
+                    owner: AccountId,
+                    deadline: u64,
+                    proposals: Vec<Proposal>,
+                }
+
+                impl Governance {
+                    #[ink(constructor)]
+                    pub fn new(deadline: u64) -> Self {
+                        Self { owner: Self::env().caller(), deadline, proposals: Vec::new() }
+                    }
+
+                    #[ink(message)]
+                    pub fn submit_proposal(&mut self, text: Vec<u8>) {
+                        let time_limit = self.deadline;
+                        let now = self.env().block_timestamp();
+                        assert!(now < time_limit, "voting window closed");
+
+                        let author = self.env().caller();
+                        self.proposals.push(Proposal { author, text, votes: 0 });
+                    }
+
+                    #[ink(message)]
+                    pub fn proposal_count(&self) -> u32 {
+                        self.proposals.len() as u32
+                    }
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag an unbounded push whose only guard is a time window, \
+             regardless of a local named `time_limit`"
+        );
+    }
+
+    // Same class: bound vocabulary present as a *value computation* rather than
+    // an enforced condition. `capacity`/`len()` appear in the body but nothing
+    // compares them against a cap before the push.
+    #[test]
+    fn test_still_flags_push_with_len_used_as_value_only() {
+        let source = r#"
+            impl MyContract {
+                #[ink(message)]
+                pub fn add_item(&mut self, item: u32) {
+                    let capacity = self.items.len().checked_sub(1).unwrap_or(0);
+                    self.log.push(capacity);
+                    self.items.push(item);
+                }
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should flag when len()/capacity are only computed, never enforced"
         );
     }
 

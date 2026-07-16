@@ -8,7 +8,6 @@ use crate::detectors::Detector;
 use crate::scanner::context::ScanContext;
 use crate::scanner::finding::*;
 use crate::utils::ast_helpers::*;
-use crate::utils::call_graph::build_call_graph;
 
 pub struct UnvalidatedSysvarDetector;
 
@@ -42,19 +41,17 @@ impl Detector for UnvalidatedSysvarDetector {
             return Vec::new();
         }
 
-        // Resolve local helper bodies + a call graph so that validation which is
-        // factored out into a project-local `assert_*/validate_*` helper (FP idx 4)
-        // can be recognized soundly by inspecting the helper's actual body, rather
-        // than by a blanket name-based skip.
+        // Resolve local helper bodies so that validation which is factored out
+        // into a project-local `assert_*/validate_*` helper (FP idx 4) can be
+        // recognized soundly by inspecting the helper's actual body, rather than
+        // by a blanket name-based skip.
         let helper_bodies = collect_local_fn_bodies(&ctx.ast);
-        let call_graph = build_call_graph(&ctx.ast);
 
         let mut findings = Vec::new();
         let mut visitor = SysvarVisitor {
             findings: &mut findings,
             ctx,
             helper_bodies: &helper_bodies,
-            call_graph: &call_graph,
         };
         visitor.visit_file(&ctx.ast);
         findings
@@ -119,7 +116,7 @@ fn body_has_sysvar_validation(body: &str) -> bool {
         // the hand-written address-pinning pattern (`clock_info.key != &sysvar::clock::id()`).
         || body.contains("sysvar ::")
         // FP idx 1 / idx 4: explicit key pinning via `sysvar::*::check_id(info.key)`.
-        || body.contains("check_id")
+        || body_has_sysvar_check_id(body)
         || body.contains("Clock :: get")
         || body.contains("Clock::get")
         || body.contains("Rent :: get")
@@ -136,6 +133,23 @@ fn body_has_sysvar_validation(body: &str) -> bool {
         // FP idx 1: hand-written comparison of the account key against a fixed
         // sysvar address constant.
         || (body.contains(". key") && (body.contains(":: id ()") || body.contains(":: ID")))
+}
+
+/// `check_id` only pins a *sysvar* address when it is reached through a
+/// sysvar-rooted path (`sysvar::clock::check_id`, `clock::check_id`). Matching
+/// the bare token accepts `spl_token::check_id(token_program.key)` too, which
+/// pins an unrelated *program* id and says nothing about any sysvar — the
+/// difference between what the call is spelled and what it checks.
+fn body_has_sysvar_check_id(body: &str) -> bool {
+    if !body.contains("check_id") {
+        return false;
+    }
+    std::iter::once("sysvar")
+        .chain(SYSVAR_NAMES.iter().copied())
+        .any(|module| {
+            body.contains(&format!("{} :: check_id", module))
+                || body.contains(&format!("{}::check_id", module))
+        })
 }
 
 /// Does the body actually consume the sysvar account's contents (deserialize /
@@ -166,29 +180,86 @@ fn collect_local_fn_bodies(ast: &syn::File) -> HashMap<String, String> {
     map
 }
 
+/// Does `expr` reference the binding `ident` anywhere within it? Walks the
+/// expression structurally so every way of handing a parameter to a callee is
+/// covered (`clock_info`, `&clock_info`, `clock_info.clone()`) while a mere
+/// textual coincidence elsewhere cannot match.
+fn expr_mentions_ident(expr: &syn::Expr, ident: &str) -> bool {
+    struct IdentFinder<'a> {
+        ident: &'a str,
+        found: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for IdentFinder<'a> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if node.path.is_ident(self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+    let mut finder = IdentFinder {
+        ident,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Collects the names of functions called with `ident` among their arguments.
+/// Delegated validation only counts when the sysvar *itself* is what gets
+/// handed to the helper.
+struct DelegatedCallCollector<'a> {
+    ident: &'a str,
+    callees: Vec<String>,
+}
+
+impl<'ast, 'a> Visit<'ast> for DelegatedCallCollector<'a> {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*node.func {
+            if let Some(seg) = path.path.segments.last() {
+                if node
+                    .args
+                    .iter()
+                    .any(|arg| expr_mentions_ident(arg, self.ident))
+                {
+                    self.callees.push(seg.ident.to_string());
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+}
+
 struct SysvarVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     ctx: &'a ScanContext,
     helper_bodies: &'a HashMap<String, String>,
-    call_graph: &'a crate::utils::call_graph::CallGraph,
 }
 
 impl<'a> SysvarVisitor<'a> {
-    /// Returns true if any local helper invoked by `fn_name` validates the
-    /// sysvar in its own body (resolved via the call graph — no name-based
-    /// guessing). This suppresses FP idx 4 without introducing false negatives:
-    /// the helper must actually contain a validation token.
-    fn helper_validates(&self, fn_name: &str) -> bool {
-        if let Some(info) = self.call_graph.get(fn_name) {
-            for callee in &info.calls {
-                if let Some(body) = self.helper_bodies.get(callee) {
-                    if body_has_sysvar_validation(body) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+    /// Returns true if a local helper that `func` invokes **on the sysvar
+    /// parameter `ident`** validates it in its own body. This suppresses FP
+    /// idx 4 without introducing false negatives: the helper must both receive
+    /// the sysvar as an argument and actually validate it.
+    ///
+    /// The argument binding is the load-bearing half. Propagating validation
+    /// from *any* callee — the previous call-graph behaviour, which records
+    /// only callee names and no arguments — silences the detector on genuinely
+    /// vulnerable code: `validate_token_program(token_program)` pins the SPL
+    /// token program id and says nothing whatsoever about `clock_info`, yet a
+    /// name-only walk would treat the whole caller as validated.
+    fn helper_validates(&self, func: &ItemFn, ident: &str) -> bool {
+        let mut collector = DelegatedCallCollector {
+            ident,
+            callees: Vec::new(),
+        };
+        collector.visit_block(&func.block);
+
+        collector.callees.iter().any(|callee| {
+            self.helper_bodies
+                .get(callee)
+                .is_some_and(|body| body_has_sysvar_validation(body))
+        })
     }
 }
 
@@ -242,8 +313,9 @@ impl<'ast, 'a> Visit<'ast> for SysvarVisitor<'a> {
             let body_src = fn_body_source(func);
 
             // Check for proper sysvar validation in this function's own body,
-            // or delegated to a resolved local helper.
-            if body_has_sysvar_validation(&body_src) || self.helper_validates(&fn_name) {
+            // or delegated to a resolved local helper that receives *this*
+            // sysvar param.
+            if body_has_sysvar_validation(&body_src) || self.helper_validates(func, &ident) {
                 continue;
             }
 
@@ -529,6 +601,86 @@ mod tests {
         assert!(
             !findings.is_empty(),
             "Should still flag when the called helper performs no sysvar validation"
+        );
+    }
+
+    // MUST STILL FLAG. Regression guard for the helper-delegation guard added by
+    // ADV-206: validation was propagated from *any* callee, so an unrelated
+    // helper that pins the SPL token program id (`spl_token::check_id`) silenced
+    // the detector on a completely unvalidated clock sysvar. `clock_info` here is
+    // attacker-controlled — never pinned to `sysvar::clock::id()`, never read via
+    // `Clock::from_account_info`/`Clock::get` — and its raw bytes drive the cliff
+    // check, so a forged account releases the vault early. Delegated validation
+    // only counts when the helper actually receives the sysvar.
+    #[test]
+    fn test_still_flags_when_helper_validates_a_different_account() {
+        let source = r#"
+            use solana_program::account_info::AccountInfo;
+            use solana_program::entrypoint::ProgramResult;
+            use solana_program::program_error::ProgramError;
+
+            fn validate_token_program(token_program: &AccountInfo) -> ProgramResult {
+                if !spl_token::check_id(token_program.key) {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                Ok(())
+            }
+
+            fn release_vested_tokens(
+                vault: &AccountInfo,
+                beneficiary: &AccountInfo,
+                token_program: &AccountInfo,
+                clock_info: &AccountInfo,
+                cliff_ts: i64,
+            ) -> ProgramResult {
+                validate_token_program(token_program)?;
+
+                if !beneficiary.is_signer {
+                    return Err(ProgramError::MissingRequiredSignature);
+                }
+
+                let clock_data = clock_info.try_borrow_data()?;
+                let now = i64::from_le_bytes(clock_data[32..40].try_into().unwrap());
+
+                if now < cliff_ts {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let mut vault_data = vault.try_borrow_mut_data()?;
+                vault_data[0] = 1;
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should still flag an unvalidated clock sysvar when the only validating \
+             helper is called on an unrelated account"
+        );
+    }
+
+    // MUST STILL FLAG. `spl_token::check_id` pins a program id, not a sysvar
+    // address; matching the bare `check_id` token conflates the two.
+    #[test]
+    fn test_still_flags_non_sysvar_check_id_in_own_body() {
+        let source = r#"
+            use solana_program::account_info::AccountInfo;
+            use solana_program::entrypoint::ProgramResult;
+            use solana_program::program_error::ProgramError;
+
+            fn read_timestamp(clock_info: &AccountInfo, token_program: &AccountInfo) -> ProgramResult {
+                if !spl_token::check_id(token_program.key) {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                let data = clock_info.try_borrow_data()?;
+                let _ts = i64::from_le_bytes(data[32..40].try_into().unwrap());
+                Ok(())
+            }
+        "#;
+        let findings = run_detector(source);
+        assert!(
+            !findings.is_empty(),
+            "Should still flag when check_id pins an unrelated program id rather than a sysvar"
         );
     }
 }
